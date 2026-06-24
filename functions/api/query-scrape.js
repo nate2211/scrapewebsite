@@ -64,44 +64,26 @@ async function scrapeOneUrl({ rawUrl, query, mode }) {
     };
 }
 
-export async function onRequest(context) {
-    const { request } = context;
+export async function onRequestOptions() {
+    return json({ ok: true });
+}
 
-    if (request.method === "OPTIONS") {
-        return json({ ok: true });
-    }
-
-    if (request.method === "GET") {
-        return json({
-            ok: true,
-            message: "query-scrape API is live. Use POST to run a scrape.",
-            route: "/api/query-scrape",
-            timestamp: new Date().toISOString(),
-        });
-    }
-
-    if (request.method !== "POST") {
-        return json(
-            {
-                ok: false,
-                error: `Method ${request.method} not allowed.`,
-            },
-            405
-        );
-    }
-
+export async function onRequestPost(context) {
     try {
-        const body = await request.json();
+        const body = await context.request.json();
 
         const query = String(body.query || "").trim();
         const mode = String(body.mode || "research").trim();
 
         if (!query) {
-            return json({ ok: false, error: "Missing query." }, 400);
+            return json({ error: "Missing query." }, 400);
         }
 
         const providedUrls = Array.isArray(body.urls) ? body.urls : [];
-        const urls = [...providedUrls, ...extractUrlsFromText(query)]
+        const urls = [
+            ...providedUrls,
+            ...extractUrlsFromText(query),
+        ]
             .map((url) => String(url || "").trim())
             .filter(Boolean);
 
