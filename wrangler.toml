@@ -1,6 +1,3 @@
-name = "scraperlab"
+name = "scrapewebsite"
 compatibility_date = "2026-06-22"
-
-[assets]
-directory = "./build"
-not_found_handling = "single-page-application"
+pages_build_output_dir = "build"
