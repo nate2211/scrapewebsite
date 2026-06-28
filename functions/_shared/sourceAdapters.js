@@ -4,7 +4,7 @@ import {
     validatePublicUrl,
 } from "./scrapeSecurity.js";
 
-const DEFAULT_USER_AGENT = "ScrapeWebsiteEnterpriseRouter/2.0 (+https://example.com; public-page-research)";
+const DEFAULT_USER_AGENT = "ScrapeWebsiteEnterpriseRouter/3.0 (+https://suiteofficelab.com; public-page-research; contact=unusualsuspectsclothing@gmail.com)";
 
 const CDN_HOST_HINTS = [
     "cdn", "static", "assets", "asset", "images", "img", "media", "akamai", "akamaized", "cloudfront",
@@ -17,6 +17,18 @@ const STATIC_EXTENSIONS = [
     ".gif", ".svg", ".avif", ".ico", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".woff", ".woff2",
     ".ttf", ".otf", ".eot", ".pdf",
 ];
+
+const TEXT_ASSET_EXTENSIONS = [".js", ".mjs", ".css", ".json", ".map", ".webmanifest", ".xml", ".txt"];
+
+const OFFICIAL_API_ENDPOINTS = {
+    wikipedia: "https://en.wikipedia.org/w/rest.php/v1/search/page",
+    wikidata: "https://www.wikidata.org/w/api.php?action=wbsearchentities",
+    githubRepositories: "https://api.github.com/search/repositories",
+    npmSearch: "https://registry.npmjs.org/-/v1/search",
+    nasaApod: "https://api.nasa.gov/planetary/apod",
+    nasaImages: "https://images-api.nasa.gov/search",
+    arxivQuery: "https://export.arxiv.org/api/query",
+};
 
 const LOW_VALUE_PATH_HINTS = [
     "/login", "/signin", "/sign-in", "/signup", "/register", "/cart", "/checkout", "/account", "/privacy",
@@ -105,6 +117,11 @@ function isLikelyStaticAsset(url) {
     return STATIC_EXTENSIONS.some((ext) => lower.includes(ext)) || lower.includes("/_next/static/") || lower.includes("/static/") || lower.includes("/assets/");
 }
 
+function isLikelyTextAsset(url) {
+    const lower = String(url || "").toLowerCase().split("?")[0];
+    return TEXT_ASSET_EXTENSIONS.some((ext) => lower.endsWith(ext)) || lower.includes("/_next/static/chunks/");
+}
+
 function isLikelyCdnUrl(url) {
     const host = hostnameFromUrl(url).toLowerCase();
     const path = (() => {
@@ -165,7 +182,37 @@ function extractUrlsFromHtml(html, baseUrl) {
         if (url) found.push(url);
     }
 
-    return [...new Set(found)].slice(0, 600);
+    const escapedAbsoluteRegex = /https?:\\\/\\\/[^"'<>\s)]+/gi;
+    const escapedMatches = text.match(escapedAbsoluteRegex) || [];
+    for (const raw of escapedMatches) {
+        const decoded = raw.replace(/\\\//g, "/").replace(/\\u002F/gi, "/");
+        const url = normalizeMaybeUrl(decoded.replace(/[),.;]+$/, ""), baseUrl);
+        if (url) found.push(url);
+    }
+
+    const jsonUrlRegex = /["'](?:url|href|src|canonicalUrl|contentUrl|image|thumbnail|apiUrl|endpoint)["']\s*:\s*["']([^"']+)["']/gi;
+    while ((match = jsonUrlRegex.exec(text))) {
+        const decoded = String(match[1] || "").replace(/\\\//g, "/").replace(/\\u002F/gi, "/");
+        const url = normalizeMaybeUrl(decoded, baseUrl);
+        if (url) found.push(url);
+    }
+
+    return [...new Set(found)].slice(0, 900);
+}
+
+function extractApiRouteStrings(text, baseUrl) {
+    const found = [];
+    const source = String(text || "");
+    const routeRegex = /["'`](\/?(?:api|graphql|v1|v2|v3|search|products|items|listings|catalog|browse|inventory|recommendations)[^"'`\s<>]{0,220})["'`]/gi;
+    let match;
+
+    while ((match = routeRegex.exec(source))) {
+        const raw = match[1];
+        const url = normalizeMaybeUrl(raw, baseUrl);
+        if (url && isProbablyApiUrl(url)) found.push(url);
+    }
+
+    return [...new Set(found)].slice(0, 120);
 }
 
 function scoreBranchUrl(url, { baseUrl, query, depth, includeExternalBranches }) {
@@ -317,19 +364,98 @@ function parseRssItems(xml, sourceId, sourceLabel, limit = 10) {
     });
 }
 
+async function probeTextAsset({ assetUrl, source, sourceLabel, query, mode, parentUrl }) {
+    try {
+        if (!isLikelyTextAsset(assetUrl)) return null;
+
+        const parsed = validatePublicUrl(assetUrl);
+        const { response, text, truncated } = await fetchLimited(parsed.toString());
+        const contentType = response.headers.get("content-type") || "";
+        const finalUrl = response.url || parsed.toString();
+        const urls = extractUrlsFromHtml(text, finalUrl);
+        const apiRoutes = extractApiRouteStrings(text, finalUrl);
+
+        const discovered = urls
+            .map((url) => ({
+                url,
+                hostname: hostnameFromUrl(url),
+                staticAsset: isLikelyStaticAsset(url),
+                cdn: isLikelyCdnUrl(url),
+                apiLike: isProbablyApiUrl(url),
+            }))
+            .filter((item) => item.apiLike || item.cdn || item.staticAsset)
+            .slice(0, 120);
+
+        const apiHints = [...new Set([
+            ...apiRoutes,
+            ...discovered.filter((item) => item.apiLike).map((item) => item.url),
+        ])].slice(0, 80);
+
+        return {
+            ok: true,
+            type: "asset-probe-result",
+            source,
+            sourceLabel,
+            title: `Static asset probe: ${hostnameFromUrl(finalUrl)}`,
+            url: finalUrl,
+            hostname: hostnameFromUrl(finalUrl),
+            parentUrl,
+            depth: 0,
+            contentType,
+            truncated: Boolean(truncated),
+            description: `${apiHints.length} API-like endpoint(s), ${discovered.length} useful link signal(s) found inside a CDN/static asset.`,
+            discovery: {
+                linksFound: discovered.length,
+                branchCandidates: 0,
+                cdnLinksFound: discovered.filter((item) => item.cdn || item.staticAsset).length,
+                apiHintsFound: apiHints.length,
+                branchLinks: [],
+                cdnLinks: discovered.filter((item) => item.cdn || item.staticAsset),
+                apiHints: apiHints.map((url) => ({
+                    url,
+                    hostname: hostnameFromUrl(url),
+                    sameHost: hostnameFromUrl(url) === hostnameFromUrl(finalUrl),
+                    apiLike: true,
+                })),
+            },
+            data: {
+                url: finalUrl,
+                title: `Static asset probe: ${hostnameFromUrl(finalUrl)}`,
+                description: "Extracted links from JavaScript/CSS/JSON asset text.",
+                wordCount: cleanText(text, 5000).split(/\s+/).filter(Boolean).length,
+                links: discovered.map((item) => item.url),
+                cdnLinks: discovered.filter((item) => item.cdn || item.staticAsset).map((item) => item.url),
+                apiHints,
+                preview: cleanText(text, 900),
+            },
+        };
+    } catch (error) {
+        return {
+            ok: false,
+            type: "asset-probe-error",
+            source,
+            sourceLabel,
+            url: assetUrl,
+            hostname: hostnameFromUrl(assetUrl),
+            parentUrl,
+            error: error.message || "Static asset probe failed.",
+        };
+    }
+}
+
 function buildScrapeResult({
-                               source,
-                               sourceLabel,
-                               url,
-                               query,
-                               mode,
-                               parentUrl = null,
-                               depth = 0,
-                               response,
-                               text,
-                               truncated,
-                               crawlOptions = {},
-                           }) {
+    source,
+    sourceLabel,
+    url,
+    query,
+    mode,
+    parentUrl = null,
+    depth = 0,
+    response,
+    text,
+    truncated,
+    crawlOptions = {},
+}) {
     const contentType = response.headers.get("content-type") || "";
     const finalUrl = response.url || url;
     const data = extractPageData({
@@ -382,13 +508,13 @@ function buildScrapeResult({
 }
 
 export async function crawlBranchFromSeed({
-                                              sourceId = "direct-url",
-                                              sourceLabel = "Direct URL",
-                                              seedUrl,
-                                              query,
-                                              mode,
-                                              crawlOptions = {},
-                                          }) {
+    sourceId = "direct-url",
+    sourceLabel = "Direct URL",
+    seedUrl,
+    query,
+    mode,
+    crawlOptions = {},
+}) {
     const maxDepth = Math.min(Math.max(Number(crawlOptions.crawlDepth ?? (mode === "quick" ? 0 : 1)), 0), 2);
     const branchLimit = Math.min(Math.max(Number(crawlOptions.branchLimit ?? 4), 0), 8);
     const queue = [{ url: seedUrl, parentUrl: null, depth: 0 }];
@@ -420,6 +546,27 @@ export async function crawlBranchFromSeed({
             });
 
             results.push(result);
+
+            const assetProbeLimit = Math.min(Math.max(Number(crawlOptions.assetProbeLimit ?? 0), 0), 6);
+            if (next.depth === 0 && assetProbeLimit > 0) {
+                const textAssets = result.discovery.cdnLinks
+                    .map((item) => item.url)
+                    .filter(isLikelyTextAsset)
+                    .slice(0, assetProbeLimit);
+
+                for (const assetUrl of textAssets) {
+                    const assetResult = await probeTextAsset({
+                        assetUrl,
+                        source: sourceId,
+                        sourceLabel,
+                        query,
+                        mode,
+                        parentUrl: result.url,
+                    });
+
+                    if (assetResult) results.push(assetResult);
+                }
+            }
 
             if (next.depth < maxDepth && branchLimit > 0) {
                 const children = result.discovery.branchLinks
@@ -486,7 +633,7 @@ async function runEbay(source, query, env) {
 }
 
 async function runGitHub(source, query) {
-    const url = `https://api.github.com/search/repositories?q=${encodeQuery(query)}&sort=stars&order=desc&per_page=10`;
+    const url = `${OFFICIAL_API_ENDPOINTS.githubRepositories}?q=${encodeQuery(query)}&sort=stars&order=desc&per_page=10`;
     const data = await fetchJson(url, {
         headers: { Accept: "application/vnd.github+json" },
     });
@@ -507,7 +654,7 @@ async function runGitHub(source, query) {
 }
 
 async function runNpm(source, query) {
-    const url = `https://registry.npmjs.org/-/v1/search?text=${encodeQuery(query)}&size=10`;
+    const url = `${OFFICIAL_API_ENDPOINTS.npmSearch}?text=${encodeQuery(query)}&size=10`;
     const data = await fetchJson(url);
 
     return (data.objects || []).map((item, index) => {
@@ -576,7 +723,7 @@ async function runReddit(source, query) {
 }
 
 async function runWikipedia(source, query) {
-    const url = `https://en.wikipedia.org/w/rest.php/v1/search/page?q=${encodeQuery(query)}&limit=10`;
+    const url = `${OFFICIAL_API_ENDPOINTS.wikipedia}?q=${encodeQuery(query)}&limit=10`;
     const data = await fetchJson(url, {
         headers: { "Api-User-Agent": DEFAULT_USER_AGENT },
     });
@@ -596,8 +743,10 @@ async function runWikipedia(source, query) {
 }
 
 async function runWikidata(source, query) {
-    const url = `https://www.wikidata.org/w/api.php?action=wbsearchentities&language=en&format=json&limit=10&search=${encodeQuery(query)}`;
-    const data = await fetchJson(url);
+    const url = `${OFFICIAL_API_ENDPOINTS.wikidata}&language=en&format=json&limit=10&search=${encodeQuery(query)}`;
+    const data = await fetchJson(url, {
+        headers: { "Api-User-Agent": DEFAULT_USER_AGENT },
+    });
 
     return (data.search || []).map((item, index) => ({
         ok: true,
@@ -618,7 +767,7 @@ async function runNasaOpen(source, query, env) {
     const q = String(query || "").toLowerCase();
 
     if (q.includes("apod") || q.includes("astronomy picture")) {
-        const data = await fetchJson(`https://api.nasa.gov/planetary/apod?api_key=${encodeURIComponent(key)}`);
+        const data = await fetchJson(`${OFFICIAL_API_ENDPOINTS.nasaApod}?api_key=${encodeURIComponent(key)}`);
         return [{
             ok: true,
             type: "source-result",
@@ -638,7 +787,7 @@ async function runNasaOpen(source, query, env) {
 }
 
 async function runNasaImages(source, query) {
-    const url = `https://images-api.nasa.gov/search?q=${encodeQuery(query)}&media_type=image,video`;
+    const url = `${OFFICIAL_API_ENDPOINTS.nasaImages}?q=${encodeQuery(query)}&media_type=image,video`;
     const data = await fetchJson(url);
     const items = data?.collection?.items || [];
 
@@ -663,7 +812,7 @@ async function runNasaImages(source, query) {
 }
 
 async function runArxiv(source, query) {
-    const url = `https://export.arxiv.org/api/query?search_query=all:${encodeQuery(query)}&start=0&max_results=10`;
+    const url = `${OFFICIAL_API_ENDPOINTS.arxivQuery}?search_query=all:${encodeQuery(query)}&start=0&max_results=10`;
     const { text } = await fetchText(url, {
         headers: { Accept: "application/atom+xml,application/xml,text/xml" },
     });

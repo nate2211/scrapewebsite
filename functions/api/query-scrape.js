@@ -7,6 +7,7 @@ const MAX_TOTAL_RESULTS = 80;
 const MAX_SOURCES = 16;
 const MAX_CRAWL_DEPTH = 2;
 const MAX_BRANCH_LIMIT = 8;
+const MAX_ASSET_PROBE_LIMIT = 6;
 
 function clampNumber(value, min, max, fallback) {
     const number = Number(value);
@@ -58,10 +59,7 @@ function buildDirectUrlList({ query, providedUrls }) {
         ...extractUrlsFromText(query),
     ];
 
-    return [...new Set(rawUrls.map(normalizeUrlForDedupe).filter(Boolean))].slice(
-        0,
-        MAX_DIRECT_URLS
-    );
+    return [...new Set(rawUrls.map(normalizeUrlForDedupe).filter(Boolean))].slice(0, MAX_DIRECT_URLS);
 }
 
 function dedupeResults(results) {
@@ -77,7 +75,6 @@ function dedupeResults(results) {
         ].join("|");
 
         if (seen.has(key)) continue;
-
         seen.add(key);
         out.push(result);
     }
@@ -108,32 +105,16 @@ function summarizeResults(results) {
         if (result.ok) summary.ok += 1;
         else summary.errors += 1;
 
-        if (result.type === "direct-site-result" || result.type === "scrape") {
-            summary.directPages += 1;
-        }
-
-        if (result.type === "branched-page-result") {
-            summary.branchedPages += 1;
-        }
-
-        if (result.type === "source-result") {
-            summary.sourceResults += 1;
-        }
-
-        if (result.type === "product-result") {
-            summary.productResults += 1;
-        }
+        if (result.type === "direct-site-result" || result.type === "scrape") summary.directPages += 1;
+        if (result.type === "branched-page-result") summary.branchedPages += 1;
+        if (result.type === "source-result") summary.sourceResults += 1;
+        if (result.type === "product-result") summary.productResults += 1;
 
         const cdnLinks = result.discovery?.cdnLinks || result.data?.cdnLinks || [];
         const apiHints = result.discovery?.apiHints || result.data?.apiHints || [];
 
-        for (const item of cdnLinks) {
-            cdnSet.add(typeof item === "string" ? item : item.url);
-        }
-
-        for (const item of apiHints) {
-            apiSet.add(typeof item === "string" ? item : item.url);
-        }
+        for (const item of cdnLinks) cdnSet.add(typeof item === "string" ? item : item.url);
+        for (const item of apiHints) apiSet.add(typeof item === "string" ? item : item.url);
     }
 
     summary.cdnLinks = [...cdnSet].filter(Boolean).length;
@@ -154,21 +135,15 @@ function collectDiscoveredLinks(results) {
         const branchLinks = result.discovery?.branchLinks || [];
 
         for (const item of cdnLinks) {
-            if (item?.url && !cdn.has(item.url)) {
-                cdn.set(item.url, { ...item, source });
-            }
+            if (item?.url && !cdn.has(item.url)) cdn.set(item.url, { ...item, source });
         }
 
         for (const item of apiHints) {
-            if (item?.url && !api.has(item.url)) {
-                api.set(item.url, { ...item, source });
-            }
+            if (item?.url && !api.has(item.url)) api.set(item.url, { ...item, source });
         }
 
         for (const item of branchLinks) {
-            if (item?.url && !branches.has(item.url)) {
-                branches.set(item.url, { ...item, source });
-            }
+            if (item?.url && !branches.has(item.url)) branches.set(item.url, { ...item, source });
         }
     }
 
@@ -209,17 +184,15 @@ async function scrapeDirectUrls({ urls, query, mode, crawlOptions }) {
                 crawlOptions,
             });
         } catch (error) {
-            return [
-                {
-                    ok: false,
-                    type: "scrape-error",
-                    source: "direct-url",
-                    sourceLabel: "Direct URL",
-                    url: rawUrl,
-                    hostname: hostnameFromUrl(rawUrl),
-                    error: error.message || "Scrape failed.",
-                },
-            ];
+            return [{
+                ok: false,
+                type: "scrape-error",
+                source: "direct-url",
+                sourceLabel: "Direct URL",
+                url: rawUrl,
+                hostname: hostnameFromUrl(rawUrl),
+                error: error.message || "Scrape failed.",
+            }];
         }
     });
 
@@ -253,6 +226,7 @@ export async function onRequestGet() {
             branchLimit: 4,
             includeCdn: true,
             includeExternalBranches: false,
+            assetProbeLimit: 3,
         },
     });
 }
@@ -267,20 +241,11 @@ export async function onRequestPost(context) {
         const query = String(body.query || "").trim();
         const mode = String(body.mode || "research").trim();
         const maxSources = clampNumber(body.maxSources, 1, MAX_SOURCES, 8);
-        const crawlDepth = clampNumber(
-            body.crawlDepth,
-            0,
-            MAX_CRAWL_DEPTH,
-            mode === "quick" ? 0 : 1
-        );
-        const branchLimit = clampNumber(
-            body.branchLimit,
-            0,
-            MAX_BRANCH_LIMIT,
-            mode === "quick" ? 1 : 4
-        );
+        const crawlDepth = clampNumber(body.crawlDepth, 0, MAX_CRAWL_DEPTH, mode === "quick" ? 0 : 1);
+        const branchLimit = clampNumber(body.branchLimit, 0, MAX_BRANCH_LIMIT, mode === "quick" ? 1 : 4);
         const includeCdn = boolValue(body.includeCdn, true);
         const includeExternalBranches = boolValue(body.includeExternalBranches, false);
+        const assetProbeLimit = clampNumber(body.assetProbeLimit, 0, MAX_ASSET_PROBE_LIMIT, mode === "links" ? 4 : 2);
 
         if (!query) {
             return json({ ok: false, requestId: id, error: "Missing query." }, 400);
@@ -302,31 +267,30 @@ export async function onRequestPost(context) {
             branchLimit,
             includeCdn,
             includeExternalBranches,
+            assetProbeLimit,
         };
 
         const warnings = [];
-
         if (includeExternalBranches) {
-            warnings.push(
-                "External branching is enabled. The crawler still validates public URLs and applies strict depth/branch limits."
-            );
+            warnings.push("External branching is enabled. The crawler still validates public URLs and applies strict depth/branch limits.");
         }
-
         if (crawlDepth === 0) {
             warnings.push("Crawl depth is 0, so only seed pages/API results are returned.");
+        }
+
+        if (assetProbeLimit > 0) {
+            warnings.push(`Static asset probing is enabled for up to ${assetProbeLimit} JS/CSS/JSON asset(s) per seed page.`);
         }
 
         const results = [];
 
         if (directUrls.length > 0) {
-            results.push(
-                ...(await scrapeDirectUrls({
-                    urls: directUrls,
-                    query,
-                    mode,
-                    crawlOptions,
-                }))
-            );
+            results.push(...await scrapeDirectUrls({
+                urls: directUrls,
+                query,
+                mode,
+                crawlOptions,
+            }));
         }
 
         const sourceResultGroups = await runPool(picked.sources, 3, async (source) => {
@@ -366,20 +330,13 @@ export async function onRequestPost(context) {
                 score: source.score || source.priority || 0,
                 requiresEnv: source.requiresEnv || [],
             })),
-            directUrls: directUrls.map((url) => ({
-                url,
-                hostname: hostnameFromUrl(url),
-            })),
+            directUrls: directUrls.map((url) => ({ url, hostname: hostnameFromUrl(url) })),
             crawlOptions,
             count: finalResults.length,
             metrics,
             discovered,
             warnings,
-            message: `Selected ${picked.sources.length} intelligent source${
-                picked.sources.length === 1 ? "" : "s"
-            }, crawled depth ${crawlDepth}, and found ${metrics.cdnLinks} CDN/static link${
-                metrics.cdnLinks === 1 ? "" : "s"
-            }.`,
+            message: `Selected ${picked.sources.length} intelligent source${picked.sources.length === 1 ? "" : "s"}, crawled depth ${crawlDepth}, and found ${metrics.cdnLinks} CDN/static link${metrics.cdnLinks === 1 ? "" : "s"}.`,
             results: finalResults,
             elapsedMs,
             timestamp: new Date().toISOString(),

@@ -4,27 +4,24 @@ const INTENT_RULES = [
     {
         intent: "resale",
         words: [
-            "resale", "sold", "price", "worth", "value", "comp", "market price",
-            "used", "secondhand", "depop", "poshmark", "grailed", "mercari",
-            "bunjang", "bunjung", "zenmarket", "stockx", "vestiaire", "realreal",
-            "vintage", "archive", "designer", "listing", "listings",
+            "resale", "sold", "price", "worth", "value", "comp", "market price", "used", "secondhand",
+            "depop", "poshmark", "grailed", "mercari", "bunjang", "bunjung", "zenmarket", "stockx",
+            "vestiaire", "realreal", "vintage", "archive", "designer", "listing", "listings",
         ],
     },
     {
         intent: "fashion",
         words: [
-            "shirt", "hoodie", "jacket", "pants", "jeans", "sneaker", "shoes",
-            "tee", "sweater", "raf", "raf simons", "rick owens", "supreme",
-            "stussy", "nike", "adidas", "jordan", "chrome hearts", "kapital",
-            "undercover", "issey", "prada", "margiela", "archive fashion",
+            "shirt", "hoodie", "jacket", "pants", "jeans", "sneaker", "shoes", "tee", "sweater",
+            "raf", "raf simons", "rick owens", "supreme", "stussy", "nike", "adidas", "jordan",
+            "chrome hearts", "kapital", "undercover", "issey", "prada", "margiela", "archive fashion",
         ],
     },
     {
         intent: "japan",
         words: [
-            "japan", "japanese", "mercari japan", "zenmarket", "buyee",
-            "yahoo auctions", "rakuten", "rakuma", "jp", "メルカリ",
-            "ヤフオク", "日本",
+            "japan", "japanese", "mercari japan", "zenmarket", "buyee", "yahoo auctions", "rakuten", "rakuma",
+            "jp", "メルカリ", "ヤフオク", "日本",
         ],
     },
     {
@@ -34,60 +31,57 @@ const INTENT_RULES = [
     {
         intent: "streetwear",
         words: [
-            "hypebeast", "highsnobiety", "drop", "release", "streetwear",
-            "supreme", "sneaker", "fashion news", "jordan release", "nike release",
+            "hypebeast", "highsnobiety", "drop", "release", "streetwear", "supreme", "sneaker",
+            "fashion news", "jordan release", "nike release",
         ],
     },
     {
         intent: "news",
         words: [
-            "news", "cnn", "nbc", "breaking", "politics", "world", "war",
-            "election", "economy", "reuters", "associated press", "ap news",
-            "bbc", "latest", "today",
+            "news", "cnn", "nbc", "breaking", "politics", "world", "war", "election", "economy",
+            "reuters", "associated press", "ap news", "bbc", "latest", "today",
         ],
     },
     {
         intent: "space",
         words: [
-            "space", "nasa", "rocket", "launch", "moon", "mars", "astronomy",
-            "telescope", "starship", "spacex", "esa", "asteroid", "apod",
+            "space", "nasa", "rocket", "launch", "moon", "mars", "astronomy", "telescope",
+            "starship", "spacex", "esa", "asteroid", "apod",
         ],
     },
     {
         intent: "developer",
         words: [
-            "github", "code", "repo", "api", "javascript", "react", "python",
-            "cloudflare", "worker", "node", "npm", "library", "docs",
-            "documentation", "endpoint", "json", "cdn",
+            "github", "code", "repo", "api", "javascript", "react", "python", "cloudflare", "worker",
+            "node", "npm", "library", "docs", "documentation", "endpoint", "json", "cdn",
         ],
     },
     {
         intent: "science",
         words: [
-            "paper", "research", "arxiv", "study", "physics", "machine learning",
-            "ai model", "biology", "chemistry", "journal", "experiment",
+            "paper", "research", "arxiv", "study", "physics", "machine learning", "ai model",
+            "biology", "chemistry", "journal", "experiment",
         ],
     },
     {
         intent: "reference",
         words: [
-            "wikipedia", "wiki", "what is", "who is", "history of", "definition",
-            "overview", "explain", "encyclopedia", "background",
+            "wikipedia", "wiki", "what is", "who is", "history of", "definition", "overview", "explain",
+            "encyclopedia", "background",
         ],
     },
     {
         intent: "product",
         words: [
-            "buy", "shopping", "product", "item", "sku", "model", "deal",
-            "discount", "retail", "store", "price", "listing", "available",
+            "buy", "shopping", "product", "item", "sku", "model", "deal", "discount", "retail", "store",
+            "price", "listing", "available",
         ],
     },
     {
         intent: "assets",
         words: [
-            "cdn", "asset", "assets", "image link", "script", "static", "_next",
-            "chunk", "api route", "endpoint", "hidden links", "link discovery",
-            "crawl", "branch", "branch down",
+            "cdn", "asset", "assets", "image link", "script", "static", "_next", "chunk", "api route",
+            "endpoint", "hidden links", "link discovery", "crawl", "branch", "branch down",
         ],
     },
 ];
@@ -137,36 +131,20 @@ function scoreSource(source, { text, intents, mode }) {
 
     if (sourceHasKeyword(source, text)) score += 22;
 
+    // Good default for broad research queries.
     if (intents.includes("research") && source.group === "reference") score += 22;
     if (intents.includes("reference") && source.group === "reference") score += 30;
 
-    if (
-        intents.includes("resale") &&
-        [
-            "resale",
-            "resale-japan",
-            "resale-korea",
-            "proxy-japan",
-            "luxury-resale",
-            "resale-verified",
-        ].includes(source.group)
-    ) {
+    // Query-specific marketplace routing.
+    if (intents.includes("resale") && ["resale", "resale-japan", "resale-korea", "proxy-japan", "luxury-resale", "resale-verified"].includes(source.group)) {
         score += 38;
     }
 
-    if (
-        intents.includes("fashion") &&
-        ["resale", "streetwear-news", "sneaker-news", "luxury-resale"].includes(
-            source.group
-        )
-    ) {
+    if (intents.includes("fashion") && ["resale", "streetwear-news", "sneaker-news", "luxury-resale"].includes(source.group)) {
         score += 18;
     }
 
-    if (
-        intents.includes("japan") &&
-        ["resale-japan", "proxy-japan", "retail-japan"].includes(source.group)
-    ) {
+    if (intents.includes("japan") && ["resale-japan", "proxy-japan", "retail-japan"].includes(source.group)) {
         score += 45;
     }
 
@@ -178,57 +156,26 @@ function scoreSource(source, { text, intents, mode }) {
         score += 45;
     }
 
-    if (
-        intents.includes("science") &&
-        ["science", "science-news", "reference", "space"].includes(source.group)
-    ) {
+    if (intents.includes("science") && ["science", "science-news", "reference", "space"].includes(source.group)) {
         score += 25;
     }
 
-    if (
-        intents.includes("developer") &&
-        String(source.group || "").includes("developer")
-    ) {
+    if (intents.includes("developer") && String(source.group || "").includes("developer")) {
         score += 38;
     }
 
-    if (
-        intents.includes("assets") &&
-        ["developer", "developer-docs", "reference"].includes(source.group)
-    ) {
+    if (intents.includes("assets") && ["developer", "developer-docs", "reference"].includes(source.group)) {
         score += 18;
     }
 
-    if (
-        intents.includes("resale") &&
-        source.group === "news" &&
-        !intents.includes("streetwear")
-    ) {
-        score -= 70;
-    }
+    // Keep source families clean unless the query really asks for that family.
+    if (intents.includes("resale") && source.group === "news" && !intents.includes("streetwear")) score -= 70;
+    if ((intents.includes("news") || intents.includes("space")) && String(source.group || "").startsWith("resale")) score -= 78;
+    if (intents.includes("developer") && String(source.group || "").startsWith("resale") && !intents.includes("resale")) score -= 65;
+    if (mode === "quick" && source.type === "api" && source.requiresEnv?.length) score -= 10;
 
-    if (
-        (intents.includes("news") || intents.includes("space")) &&
-        String(source.group || "").startsWith("resale")
-    ) {
-        score -= 78;
-    }
-
-    if (
-        intents.includes("developer") &&
-        String(source.group || "").startsWith("resale") &&
-        !intents.includes("resale")
-    ) {
-        score -= 65;
-    }
-
-    if (mode === "quick" && source.type === "api" && source.requiresEnv?.length) {
-        score -= 10;
-    }
-
-    if (text.includes(lower(source.id)) || text.includes(lower(source.label))) {
-        score += 60;
-    }
+    // Exact ID / label mention should win.
+    if (text.includes(lower(source.id)) || text.includes(lower(source.label))) score += 60;
 
     return score;
 }
@@ -268,15 +215,9 @@ export function detectIntents(query, mode = "research") {
         intents.add("research");
     }
 
+    // If the user asks a broad query without marketplace/news/dev language, use references first.
     const tokens = tokenSet(query);
-
-    if (
-        tokens.size <= 5 &&
-        !intents.has("resale") &&
-        !intents.has("news") &&
-        !intents.has("developer") &&
-        !intents.has("space")
-    ) {
+    if (tokens.size <= 5 && !intents.has("resale") && !intents.has("news") && !intents.has("developer") && !intents.has("space")) {
         intents.add("reference");
     }
 
@@ -284,11 +225,11 @@ export function detectIntents(query, mode = "research") {
 }
 
 export function pickSourcesForQuery({
-                                        query,
-                                        mode = "research",
-                                        requestedSources = [],
-                                        maxSources = 8,
-                                    }) {
+    query,
+    mode = "research",
+    requestedSources = [],
+    maxSources = 8,
+}) {
     const text = lower(`${query} ${mode}`);
     const intents = detectIntents(query, mode);
     const max = Math.min(Math.max(Number(maxSources || 8), 1), 16);
@@ -308,15 +249,7 @@ export function pickSourcesForQuery({
     }
 
     let threshold = 58;
-
-    if (
-        intents.includes("resale") ||
-        intents.includes("news") ||
-        intents.includes("developer")
-    ) {
-        threshold = 64;
-    }
-
+    if (intents.includes("resale") || intents.includes("news") || intents.includes("developer")) threshold = 64;
     if (mode === "quick") threshold = 70;
 
     const scored = SOURCE_REGISTRY

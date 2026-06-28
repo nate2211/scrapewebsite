@@ -1,4 +1,7 @@
 export const SOURCE_REGISTRY = [
+    // -------------------------
+    // RESALE / MARKETPLACES
+    // -------------------------
     {
         id: "ebay",
         label: "eBay Browse API",
@@ -9,9 +12,8 @@ export const SOURCE_REGISTRY = [
         priority: 96,
         intents: ["resale", "product", "fashion", "sneakers", "electronics", "collectibles"],
         keywords: [
-            "resale", "price", "sold", "used", "vintage", "sneaker", "shirt",
-            "hoodie", "jacket", "raf", "rick owens", "supreme", "nike",
-            "adidas", "depop", "grailed", "poshmark", "mercari",
+            "resale", "price", "sold", "used", "vintage", "sneaker", "shirt", "hoodie", "jacket",
+            "raf", "rick owens", "supreme", "nike", "adidas", "depop", "grailed", "poshmark", "mercari",
         ],
     },
     {
@@ -45,14 +47,10 @@ export const SOURCE_REGISTRY = [
         priority: 91,
         intents: ["resale", "fashion", "streetwear", "designer", "product"],
         keywords: [
-            "grailed", "designer", "archive", "raf simons", "rick owens",
-            "helmut lang", "supreme", "stussy", "kapital", "undercover",
-            "number nine", "chrome hearts",
+            "grailed", "designer", "archive", "raf simons", "rick owens", "helmut lang", "supreme",
+            "stussy", "kapital", "undercover", "number nine", "chrome hearts",
         ],
-        buildUrl: (q) =>
-            `https://www.grailed.com/shop/${encodeURIComponent(
-                String(q).trim().replace(/\s+/g, "-")
-            )}`,
+        buildUrl: (q) => `https://www.grailed.com/shop/${encodeURIComponent(String(q).trim().replace(/\s+/g, "-"))}`,
     },
     {
         id: "mercari-us",
@@ -176,6 +174,9 @@ export const SOURCE_REGISTRY = [
         buildUrl: (q) => `https://www.vestiairecollective.com/search/?q=${encodeURIComponent(q)}`,
     },
 
+    // -------------------------
+    // STREETWEAR / SNEAKER / CULTURE NEWS
+    // -------------------------
     {
         id: "hypebeast",
         label: "Hypebeast",
@@ -243,6 +244,9 @@ export const SOURCE_REGISTRY = [
         buildUrl: (q) => `https://www.nicekicks.com/?s=${encodeURIComponent(q)}`,
     },
 
+    // -------------------------
+    // GENERAL NEWS
+    // -------------------------
     {
         id: "cnn",
         label: "CNN",
@@ -310,6 +314,9 @@ export const SOURCE_REGISTRY = [
         buildUrl: (q) => `https://www.npr.org/search?query=${encodeURIComponent(q)}`,
     },
 
+    // -------------------------
+    // REFERENCE / ENCYCLOPEDIA
+    // -------------------------
     {
         id: "wikipedia",
         label: "Wikipedia REST Search",
@@ -342,6 +349,9 @@ export const SOURCE_REGISTRY = [
         buildUrl: (q) => `https://www.britannica.com/search?query=${encodeURIComponent(q)}`,
     },
 
+    // -------------------------
+    // SPACE / SCIENCE
+    // -------------------------
     {
         id: "nasa-open",
         label: "NASA Open APIs",
@@ -430,6 +440,9 @@ export const SOURCE_REGISTRY = [
         buildUrl: (q) => `https://phys.org/search/?search=${encodeURIComponent(q)}`,
     },
 
+    // -------------------------
+    // DEV / DOCS / COMMUNITY
+    // -------------------------
     {
         id: "github",
         label: "GitHub Repository Search",
