@@ -4,6 +4,8 @@ import {
     json,
     validatePublicUrl,
 } from "../_shared/scrapeSecurity.js";
+import { pickSourcesForQuery } from "../_shared/sourceRouter.js";
+import { runSourceAdapter } from "../_shared/sourceAdapters.js";
 
 function extractUrlsFromText(value) {
     const matches = String(value || "").match(/https?:\/\/[^\s"'<>]+/gi) || [];
@@ -14,31 +16,12 @@ function extractUrlsFromText(value) {
         .slice(0, 8);
 }
 
-function buildSearchLinks(query) {
-    const encoded = encodeURIComponent(query);
-
-    return [
-        {
-            label: "Google Search",
-            url: `https://www.google.com/search?q=${encoded}`,
-        },
-        {
-            label: "Bing Search",
-            url: `https://www.bing.com/search?q=${encoded}`,
-        },
-        {
-            label: "DuckDuckGo Search",
-            url: `https://duckduckgo.com/?q=${encoded}`,
-        },
-        {
-            label: "Reddit Search",
-            url: `https://www.reddit.com/search/?q=${encoded}`,
-        },
-        {
-            label: "eBay Search",
-            url: `https://www.ebay.com/sch/i.html?_nkw=${encoded}`,
-        },
-    ];
+function hostnameFromUrl(url) {
+    try {
+        return new URL(url).hostname;
+    } catch {
+        return "";
+    }
 }
 
 async function scrapeOneUrl({ rawUrl, query, mode }) {
@@ -60,12 +43,53 @@ async function scrapeOneUrl({ rawUrl, query, mode }) {
 
     return {
         ok: true,
+        type: "scrape",
+        source: "direct-url",
+        sourceLabel: "Direct URL",
         data,
     };
 }
 
+async function scrapeDirectUrls({ urls, query, mode }) {
+    const results = [];
+
+    for (const rawUrl of urls.slice(0, 5)) {
+        try {
+            results.push(await scrapeOneUrl({ rawUrl, query, mode }));
+        } catch (error) {
+            results.push({
+                ok: false,
+                type: "scrape-error",
+                source: "direct-url",
+                sourceLabel: "Direct URL",
+                url: rawUrl,
+                hostname: hostnameFromUrl(rawUrl),
+                error: error.message || "Scrape failed.",
+            });
+        }
+    }
+
+    return results;
+}
+
 export async function onRequestOptions() {
     return json({ ok: true });
+}
+
+export async function onRequestGet() {
+    return json({
+        ok: true,
+        route: "/api/query-scrape",
+        method: "POST required",
+        smartSourceRouting: true,
+        exampleBody: {
+            query: "raf simons hoodie resale",
+            mode: "product",
+            urls: [],
+            sources: [],
+            maxSources: 8,
+        },
+    });
 }
 
 export async function onRequestPost(context) {
@@ -74,74 +98,79 @@ export async function onRequestPost(context) {
 
         const query = String(body.query || "").trim();
         const mode = String(body.mode || "research").trim();
+        const maxSources = Math.min(Math.max(Number(body.maxSources || 8), 1), 12);
 
         if (!query) {
-            return json({ error: "Missing query." }, 400);
+            return json({ ok: false, error: "Missing query." }, 400);
         }
 
         const providedUrls = Array.isArray(body.urls) ? body.urls : [];
-        const urls = [
+        const requestedSources = Array.isArray(body.sources) ? body.sources : [];
+
+        const directUrls = [
             ...providedUrls,
             ...extractUrlsFromText(query),
         ]
             .map((url) => String(url || "").trim())
             .filter(Boolean);
 
-        const uniqueUrls = [...new Set(urls)].slice(0, 5);
+        const uniqueDirectUrls = [...new Set(directUrls)].slice(0, 5);
 
-        if (uniqueUrls.length > 0) {
-            const results = [];
+        const picked = pickSourcesForQuery({
+            query,
+            mode,
+            requestedSources,
+            maxSources,
+        });
 
-            for (const rawUrl of uniqueUrls) {
-                try {
-                    results.push(await scrapeOneUrl({ rawUrl, query, mode }));
-                } catch (error) {
-                    results.push({
-                        ok: false,
-                        url: rawUrl,
-                        error: error.message || "Scrape failed.",
-                    });
-                }
-            }
+        const results = [];
 
-            return json({
-                ok: true,
-                mode,
+        if (uniqueDirectUrls.length > 0) {
+            const directResults = await scrapeDirectUrls({
+                urls: uniqueDirectUrls,
                 query,
-                count: results.length,
-                message: `Scraped ${results.length} URL${
-                    results.length === 1 ? "" : "s"
-                }.`,
-                results,
-                timestamp: new Date().toISOString(),
+                mode,
             });
+
+            results.push(...directResults);
+        }
+
+        for (const source of picked.sources) {
+            const sourceResults = await runSourceAdapter({
+                source,
+                query,
+                mode,
+                env: context.env,
+            });
+
+            results.push(...sourceResults);
         }
 
         return json({
             ok: true,
             mode,
             query,
-            count: 1,
-            message:
-                "No direct URLs were found in the query. I created safe search links instead.",
-            results: [
-                {
-                    ok: true,
-                    type: "query-plan",
-                    query,
-                    mode,
-                    message:
-                        "Paste a direct URL into the query box to scrape it, or open one of these search links and copy a result URL back into the app.",
-                    suggestedSources: buildSearchLinks(query),
-                },
-            ],
+            smartSourceRouting: true,
+            intents: picked.intents,
+            selectedSources: picked.sources.map((source) => ({
+                id: source.id,
+                label: source.label,
+                group: source.group,
+                type: source.type,
+                score: source.score || source.priority || 0,
+            })),
+            count: results.length,
+            message: `Selected ${picked.sources.length} intelligent source${
+                picked.sources.length === 1 ? "" : "s"
+            } for this query.`,
+            results,
             timestamp: new Date().toISOString(),
         });
     } catch (error) {
         return json(
             {
                 ok: false,
-                error: error.message || "Query scrape failed.",
+                error: error.message || "Smart source query failed.",
             },
             500
         );
