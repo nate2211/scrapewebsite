@@ -34,10 +34,7 @@ function allMatches(html, regex, mapper, limit = 80) {
 
     while ((match = regex.exec(String(html || ""))) && out.length < limit) {
         const item = mapper(match);
-
-        if (item) {
-            out.push(item);
-        }
+        if (item) out.push(item);
     }
 
     return out;
@@ -47,18 +44,31 @@ function unique(items) {
     return [...new Set(items.filter(Boolean))];
 }
 
-export function analyzeHtmlLocally({ html, baseUrl = "https://example.com", query = "" }) {
+export function analyzeHtmlLocally({
+                                       html,
+                                       baseUrl = "https://example.com",
+                                       query = "",
+                                   }) {
     const source = String(html || "");
     const text = cleanText(source);
 
     const title =
         firstMatch(source, /<title[^>]*>([\s\S]*?)<\/title>/i) ||
-        firstMatch(source, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ||
+        firstMatch(
+            source,
+            /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
+        ) ||
         "Untitled HTML";
 
     const description =
-        firstMatch(source, /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i) ||
-        firstMatch(source, /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i);
+        firstMatch(
+            source,
+            /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i
+        ) ||
+        firstMatch(
+            source,
+            /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i
+        );
 
     const headings = allMatches(
         source,
@@ -67,7 +77,7 @@ export function analyzeHtmlLocally({ html, baseUrl = "https://example.com", quer
             level: Number(match[1]),
             text: cleanText(match[2]).slice(0, 220),
         }),
-        60
+        80
     );
 
     const links = allMatches(
@@ -82,7 +92,7 @@ export function analyzeHtmlLocally({ html, baseUrl = "https://example.com", quer
                 text: cleanText(match[2]).slice(0, 180),
             };
         },
-        120
+        160
     );
 
     const images = allMatches(
@@ -97,30 +107,37 @@ export function analyzeHtmlLocally({ html, baseUrl = "https://example.com", quer
                 alt: firstMatch(match[0], /alt=["']([^"']*)["']/i),
             };
         },
-        80
+        100
     );
 
     const prices = unique(
-        source.match(/(?:\$|USD\s?)\s?\d{1,5}(?:,\d{3})*(?:\.\d{2})?/gi) || []
-    ).slice(0, 40);
+        source.match(/(?:\$|USD\s?)\s?\d{1,6}(?:,\d{3})*(?:\.\d{2})?/gi) ||
+        []
+    ).slice(0, 60);
 
     const apiCandidates = unique(
-        (source.match(
-            /https?:\/\/[^\s"'<>\\]+|\/(?:api|graphql|v\d+|search|products|items|listings|query)[^\s"'<>\\]*/gi
-        ) || [])
+        (
+            source.match(
+                /https?:\/\/[^\s"'<>\\]+|\/(?:api|graphql|v\d+|search|products|items|listings|query)[^\s"'<>\\]*/gi
+            ) || []
+        )
             .map((item) => normalizeUrl(item, baseUrl))
             .filter((url) =>
-                /\/api\/|graphql|\/v\d+\/|search|products|items|listings|query/i.test(url || "")
+                /\/api\/|graphql|\/v\d+\/|search|products|items|listings|query/i.test(
+                    url || ""
+                )
             )
-    ).slice(0, 80);
+    ).slice(0, 120);
 
     const queryWords = String(query || "")
         .toLowerCase()
         .split(/\s+/)
         .filter((word) => word.length > 2);
 
+    const lowerText = text.toLowerCase();
+
     const queryScore = queryWords.reduce((score, word) => {
-        return text.toLowerCase().includes(word) ? score + 1 : score;
+        return lowerText.includes(word) ? score + 1 : score;
     }, 0);
 
     return {
