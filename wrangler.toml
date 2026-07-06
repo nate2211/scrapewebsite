@@ -5,3 +5,8 @@ pages_build_output_dir = "build"
 [[kv_namespaces]]
 binding = "STREAM_SIGNALING"
 id = "c63aa4c7cd3c4f2a9d346aba10c8e972"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "audiomasterlab-community"
+database_id = "5b272eb4-5bea-49ea-abe1-dd55ec2a7aec"
