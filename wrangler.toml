@@ -1,3 +1,7 @@
 name = "scrapewebsite"
 compatibility_date = "2026-06-22"
 pages_build_output_dir = "build"
+
+[[kv_namespaces]]
+binding = "STREAM_SIGNALING"
+id = "c63aa4c7cd3c4f2a9d346aba10c8e972"
