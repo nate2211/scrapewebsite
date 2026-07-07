@@ -23,6 +23,7 @@ function getCorsHeaders(request) {
         "https://videowebsite.unusualsuspectsclothing.workers.dev",
         "https://imagemasterlab.com",
         "http://localhost:3000",
+        "http://localhost:3001",
         "http://localhost:5173",
     ]);
 
