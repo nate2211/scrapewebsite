@@ -19,6 +19,7 @@ function getCorsHeaders(request) {
         "https://suiteofficelab.com",
         "https://audiomasterlab.com",
         "https://www.audiomasterlab.com",
+        "https://videomasterlab.com",
         "https://videowebsite.unusualsuspectsclothing.workers.dev",
         "https://imagemasterlab.com",
         "http://localhost:3000",
