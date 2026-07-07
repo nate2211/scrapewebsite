@@ -10,3 +10,8 @@ id = "c63aa4c7cd3c4f2a9d346aba10c8e972"
 binding = "DB"
 database_name = "audiomasterlab-community"
 database_id = "5b272eb4-5bea-49ea-abe1-dd55ec2a7aec"
+
+[[d1_databases]]
+binding = "PYTHONROUTER"
+database_name = "pythonrouter"
+database_id = "108784d8-3081-4dc2-8266-3320555b984a"
