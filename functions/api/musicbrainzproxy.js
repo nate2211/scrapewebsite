@@ -3,6 +3,7 @@ const ALLOWED_ORIGINS = new Set([
     "https://audiomasterlab.com",
     "https://www.audiomasterlab.com",
     "https://videomasterlab.com",
+    "https://imagemasterlab.com",
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:5173",
@@ -10,20 +11,39 @@ const ALLOWED_ORIGINS = new Set([
 
 const MUSICBRAINZ_ROOT = "https://musicbrainz.org/ws/2";
 
+const ALLOWED_TYPES = new Set([
+    "artist",
+    "recording",
+    "release",
+    "release-group",
+    "label",
+    "work",
+    "area",
+    "event",
+    "place",
+    "instrument",
+    "series",
+    "tag",
+    "url",
+]);
+
 function corsHeaders(request) {
     const origin = request.headers.get("Origin") || "";
-    const allowedOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "https://audiomasterlab.com";
+    const allowedOrigin = ALLOWED_ORIGINS.has(origin)
+        ? origin
+        : "https://audiomasterlab.com";
 
     return {
         "Access-Control-Allow-Origin": allowedOrigin,
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Accept",
         "Access-Control-Max-Age": "86400",
+        "Access-Control-Expose-Headers": "Content-Type, Cache-Control",
         "Vary": "Origin",
     };
 }
 
-function json(data, status = 200, request) {
+function jsonResponse(request, data, status = 200) {
     return new Response(JSON.stringify(data, null, 2), {
         status,
         headers: {
@@ -40,7 +60,28 @@ function clampInt(value, fallback, min, max) {
     return Math.max(min, Math.min(max, parsed));
 }
 
-function buildMusicBrainzSearchUrl(request) {
+function cleanInc(value) {
+    const inc = String(value || "").trim();
+    if (!inc) return "";
+
+    if (inc.length > 240 || !/^[a-zA-Z0-9_\-+\s]+$/.test(inc)) {
+        throw new Error("Invalid inc parameter.");
+    }
+
+    return inc.replace(/\s+/g, "+");
+}
+
+function requireMbid(value) {
+    const mbid = String(value || "").trim();
+
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mbid)) {
+        throw new Error("Invalid or missing mbid parameter.");
+    }
+
+    return mbid;
+}
+
+function buildSearchUrl(request) {
     const incoming = new URL(request.url);
 
     const type = incoming.searchParams.get("type") || "artist";
@@ -48,23 +89,7 @@ function buildMusicBrainzSearchUrl(request) {
     const limit = clampInt(incoming.searchParams.get("limit"), 25, 1, 100);
     const offset = clampInt(incoming.searchParams.get("offset"), 0, 0, 10000);
 
-    const allowedTypes = new Set([
-        "artist",
-        "recording",
-        "release",
-        "release-group",
-        "label",
-        "work",
-        "area",
-        "event",
-        "place",
-        "instrument",
-        "series",
-        "tag",
-        "url",
-    ]);
-
-    if (!allowedTypes.has(type)) {
+    if (!ALLOWED_TYPES.has(type)) {
         throw new Error(`Unsupported MusicBrainz type: ${type}`);
     }
 
@@ -72,8 +97,12 @@ function buildMusicBrainzSearchUrl(request) {
         throw new Error("Missing q query parameter.");
     }
 
+    if (query.length > 300) {
+        throw new Error("Query is too long.");
+    }
+
     const target = new URL(`${MUSICBRAINZ_ROOT}/${type}`);
-    target.searchParams.set("query", query);
+    target.searchParams.set("query", query.trim());
     target.searchParams.set("fmt", "json");
     target.searchParams.set("limit", String(limit));
     target.searchParams.set("offset", String(offset));
@@ -81,39 +110,23 @@ function buildMusicBrainzSearchUrl(request) {
     return target;
 }
 
-function buildMusicBrainzLookupUrl(request) {
+function buildLookupUrl(request) {
     const incoming = new URL(request.url);
 
     const type = incoming.searchParams.get("type") || "artist";
-    const mbid = incoming.searchParams.get("mbid") || "";
-    const inc = incoming.searchParams.get("inc") || "";
+    const mbid = requireMbid(incoming.searchParams.get("mbid"));
+    const inc = cleanInc(incoming.searchParams.get("inc"));
 
-    const allowedTypes = new Set([
-        "artist",
-        "recording",
-        "release",
-        "release-group",
-        "label",
-        "work",
-        "area",
-        "event",
-        "place",
-        "instrument",
-        "series",
-        "url",
-    ]);
-
-    if (!allowedTypes.has(type)) {
+    if (!ALLOWED_TYPES.has(type)) {
         throw new Error(`Unsupported MusicBrainz lookup type: ${type}`);
-    }
-
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mbid)) {
-        throw new Error("Invalid or missing mbid parameter.");
     }
 
     const target = new URL(`${MUSICBRAINZ_ROOT}/${type}/${mbid}`);
     target.searchParams.set("fmt", "json");
-    if (inc) target.searchParams.set("inc", inc);
+
+    if (inc) {
+        target.searchParams.set("inc", inc);
+    }
 
     return target;
 }
@@ -123,13 +136,17 @@ async function proxyJson(request, target) {
         method: "GET",
         headers: {
             "Accept": "application/json",
-            "User-Agent": "AudioMasterLab/1.0 (https://audiomasterlab.com; no-token MusicBrainz proxy)",
+            "User-Agent": "AudioMasterLab/1.0 (https://audiomasterlab.com)",
+        },
+        cf: {
+            cacheTtl: 300,
+            cacheEverything: true,
         },
     });
 
-    const text = await upstream.text();
+    const body = await upstream.text();
 
-    return new Response(text, {
+    return new Response(body, {
         status: upstream.status,
         headers: {
             ...corsHeaders(request),
@@ -139,37 +156,38 @@ async function proxyJson(request, target) {
     });
 }
 
-export default {
-    async fetch(request) {
-        if (request.method === "OPTIONS") {
-            return new Response(null, { headers: corsHeaders(request) });
-        }
+export async function onRequest({ request }) {
+    if (request.method === "OPTIONS") {
+        return new Response(null, {
+            status: 204,
+            headers: corsHeaders(request),
+        });
+    }
 
-        if (request.method !== "GET") {
-            return json({ error: "Only GET is allowed." }, 405, request);
-        }
+    if (request.method !== "GET") {
+        return jsonResponse(request, { error: "Only GET is allowed." }, 405);
+    }
 
+    try {
         const url = new URL(request.url);
         const mode = url.searchParams.get("mode") || "search";
 
-        try {
-            if (mode === "search") {
-                return await proxyJson(request, buildMusicBrainzSearchUrl(request));
-            }
-
-            if (mode === "lookup") {
-                return await proxyJson(request, buildMusicBrainzLookupUrl(request));
-            }
-
-            return json({
-                error: "Unknown mode.",
-                allowed_modes: ["search", "lookup"],
-            }, 400, request);
-        } catch (error) {
-            return json({
-                error: "MusicBrainz proxy failed.",
-                details: String(error && error.message ? error.message : error),
-            }, 400, request);
+        if (mode === "search") {
+            return await proxyJson(request, buildSearchUrl(request));
         }
-    },
-};
+
+        if (mode === "lookup") {
+            return await proxyJson(request, buildLookupUrl(request));
+        }
+
+        return jsonResponse(request, {
+            error: "Unknown mode.",
+            allowed_modes: ["search", "lookup"],
+        }, 400);
+    } catch (error) {
+        return jsonResponse(request, {
+            error: "MusicBrainz proxy failed.",
+            details: error instanceof Error ? error.message : String(error),
+        }, 400);
+    }
+}
