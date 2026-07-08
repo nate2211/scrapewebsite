@@ -8,13 +8,13 @@
 //     /api/waybackproxy?url=rafsimons.com
 //     /api/waybackproxy?preset=archive_downloads&q=lil%20uzi%20vert
 //     /api/waybackproxy?domain=freemusicarchive.org&mode=audio
-// - Avoid expensive wildcard query injection by default.
+// - Reject expensive wildcard query injection.
 // - Clamp limits and page sizes so many users can share the proxy safely.
 // - Cache identical CDX requests at the edge.
 // - Return structured JSON errors so the frontend can recover cleanly.
 //
 // Important frontend rule:
-// - Treat `q` as a client-side filter unless `queryMode=path` is explicitly used.
+// - Treat `q` as a client-side filter. Do not send keyword wildcards to CDX.
 // - For broad domains, request domain/prefix CDX rows first, then filter returned
 //   `original` URLs in the frontend for tokens like artist/title/query words.
 
@@ -55,12 +55,15 @@ const MATCH_TYPES = new Set(["exact", "prefix", "host", "domain"]);
 const OUTPUT_TYPES = new Set(["", "text", "json"]);
 const COLLAPSE_VALUES = new Set(["", "digest", "urlkey", "timestamp:4", "timestamp:6", "timestamp:8", "timestamp:10"]);
 
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 100;
-const MAX_LIMIT_FOR_PAGE_MODE = 25;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 50;
+const MAX_LIMIT_FOR_PAGE_MODE = 20;
+const MAX_LIMIT_FOR_BROAD_AUDIO = 10;
 const MAX_URL_LENGTH = 420;
 const CACHE_TTL_SECONDS = 1800;
 const STALE_REVALIDATE_SECONDS = 86400;
+const UPSTREAM_TIMEOUT_MS = 18000;
+const RETRY_TIMEOUT_MS = 9000;
 
 const DOMAIN_PRESETS = {
     archive_downloads: {
@@ -163,8 +166,12 @@ function jsonError(error, corsHeaders) {
 }
 
 function clampNumber(value, min, max, fallback) {
+    if (value === null || value === undefined || value === "") {
+        return Math.max(min, Math.min(max, fallback));
+    }
+
     const number = Number(value);
-    if (!Number.isFinite(number)) return fallback;
+    if (!Number.isFinite(number)) return Math.max(min, Math.min(max, fallback));
     return Math.max(min, Math.min(max, Math.trunc(number)));
 }
 
@@ -373,6 +380,67 @@ function applyQueryToPathTarget(target, query) {
     return `${cleanTarget}/*${tokens.join("*")}*`;
 }
 
+function isArchiveDownloadsRoot(target) {
+    const cleanTarget = stripProtocol(target)
+        .toLowerCase()
+        .replace(/[?#].*$/g, "")
+        .replace(/\/+$/g, "");
+
+    return cleanTarget === "archive.org/download";
+}
+
+function hasNarrowArchiveDownloadPath(target) {
+    const cleanTarget = stripProtocol(target)
+        .toLowerCase()
+        .replace(/[?#].*$/g, "")
+        .replace(/^\/+/, "")
+        .replace(/\/+$/g, "");
+
+    const prefix = "archive.org/download/";
+    if (!cleanTarget.startsWith(prefix)) return true;
+
+    const rest = cleanTarget.slice(prefix.length).replace(/\*/g, "");
+    return rest.length >= 3;
+}
+
+function assertRequestIsSmallEnough({ target, mode, matchType, queryMode, limit, clientQuery }) {
+    if (queryMode === "path") {
+        throw new HttpError(
+            "queryMode=path was rejected because keyword wildcards make Wayback CDX timeout. Send q as a client-side filter instead.",
+            400,
+            {
+                target,
+                clientQuery,
+                fix: "Use /api/waybackproxy?url=example.com&mode=audio&q=rap%20music. Filter q tokens after parsing returned CDX rows.",
+            }
+        );
+    }
+
+    if (mode === "audio" && isArchiveDownloadsRoot(target)) {
+        throw new HttpError(
+            "archive.org/download/ is too broad for direct Wayback audio CDX lookup.",
+            422,
+            {
+                target,
+                limit,
+                fix: "Use the Archive.org advancedsearch/metadata APIs for Archive.org audio, or pass a specific item path like archive.org/download/some_identifier/ to Wayback.",
+            }
+        );
+    }
+
+    if (mode === "audio" && !hasNarrowArchiveDownloadPath(target)) {
+        throw new HttpError(
+            "Archive download Wayback audio lookups need a specific item/path, not the global download root.",
+            422,
+            {
+                target,
+                matchType,
+                fix: "Narrow the target before CDX, for example url=archive.org/download/item_identifier/ with matchType=prefix.",
+            }
+        );
+    }
+}
+
 function buildRequestPlan(requestUrl) {
     const outerParams = requestUrl.searchParams;
     const presetId = String(outerParams.get("preset") || "").trim();
@@ -395,14 +463,15 @@ function buildRequestPlan(requestUrl) {
     const mode = normalizeMode(mergedParams.get("mode"), preset?.mode || "audio");
     const queryMode = String(mergedParams.get("queryMode") || "client").toLowerCase();
     const clientQuery = String(mergedParams.get("q") || mergedParams.get("query") || "").trim();
-    const target =
-        queryMode === "path"
-            ? applyQueryToPathTarget(normalized.target, clientQuery)
-            : normalized.target;
+    const target = normalized.target;
     const matchType = inferMatchType(target, mergedParams.get("matchType"), preset?.matchType);
     const output = normalizeOutput(mergedParams.get("output"));
     const fields = normalizeFields(mergedParams.get("fl"));
-    const maxLimit = mode === "pages" ? MAX_LIMIT_FOR_PAGE_MODE : MAX_LIMIT;
+    const maxLimit = mode === "pages"
+        ? MAX_LIMIT_FOR_PAGE_MODE
+        : isArchiveDownloadsRoot(target)
+            ? MAX_LIMIT_FOR_BROAD_AUDIO
+            : MAX_LIMIT;
     const limit = clampNumber(mergedParams.get("limit"), 1, maxLimit, DEFAULT_LIMIT);
     const pageSize = clampNumber(mergedParams.get("pageSize"), 1, 5, 1);
     const pageRaw = mergedParams.get("page");
@@ -418,6 +487,15 @@ function buildRequestPlan(requestUrl) {
     if (target.includes("*") && target.replace(/\*/g, "").length < 8) {
         throw new HttpError("Wildcard target is too broad. Use a real domain or a preset.", 400, { target });
     }
+
+    assertRequestIsSmallEnough({
+        target,
+        mode,
+        matchType,
+        queryMode,
+        limit,
+        clientQuery,
+    });
 
     const cdxParams = new URLSearchParams();
     cdxParams.set("url", target);
@@ -471,6 +549,31 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     }
 }
 
+function makeRetryPlan(plan) {
+    const currentLimit = Number(plan.limit) || DEFAULT_LIMIT;
+    if (currentLimit <= 5) return null;
+
+    const retryLimit = Math.max(1, Math.min(5, Math.floor(currentLimit / 2)));
+    const cdxParams = new URLSearchParams(plan.cdxParams);
+    cdxParams.set("limit", String(retryLimit));
+
+    if (cdxParams.has("page")) {
+        cdxParams.set("pageSize", "1");
+    }
+
+    const upstreamUrl = `${CDX_API_URL}?${cdxParams.toString()}`;
+    const cacheKey = `${plan.cacheKey}&retryLimit=${retryLimit}`;
+
+    return {
+        ...plan,
+        upstreamUrl,
+        cacheKey,
+        cdxParams,
+        limit: retryLimit,
+        retried: true,
+    };
+}
+
 function makeResponseHeaders(upstreamResponse, corsHeaders, plan) {
     const headers = new Headers(upstreamResponse.headers);
     headers.delete("Set-Cookie");
@@ -513,7 +616,7 @@ async function tryWriteCache(cacheKeyRequest, response) {
     }
 }
 
-async function requestCdx(plan, request) {
+async function requestCdx(plan, request, timeoutMs = UPSTREAM_TIMEOUT_MS) {
     const accept = request.headers.get("Accept") || (plan.output === "json" ? "application/json" : "text/plain");
 
     return fetchWithTimeout(
@@ -529,7 +632,7 @@ async function requestCdx(plan, request) {
                 cacheEverything: true,
             },
         },
-        12000
+        timeoutMs
     );
 }
 
@@ -596,23 +699,75 @@ export async function onRequest(context) {
     try {
         upstreamResponse = await requestCdx(plan, request);
     } catch (error) {
-        return jsonResponse(
-            {
-                error: "CDX upstream request timed out or failed before a response was returned.",
-                status: 504,
-                target: plan.target,
-                mode: plan.mode,
-                detail: error?.message || "fetch failed",
-            },
-            504,
-            corsHeaders,
-            {
-                "Cache-Control": "no-store",
+        const retryPlan = makeRetryPlan(plan);
+
+        if (retryPlan) {
+            try {
+                upstreamResponse = await requestCdx(retryPlan, request, RETRY_TIMEOUT_MS);
+                plan = retryPlan;
+            } catch (retryError) {
+                return jsonResponse(
+                    {
+                        error: "CDX upstream request timed out or failed before a response was returned.",
+                        status: 504,
+                        target: plan.target,
+                        mode: plan.mode,
+                        detail: retryError?.message || error?.message || "fetch failed",
+                        suggestion: "Use a narrower url target, add from/to date bounds, or reduce limit to 5.",
+                    },
+                    504,
+                    corsHeaders,
+                    {
+                        "Cache-Control": "no-store",
+                    }
+                );
             }
-        );
+        } else {
+            return jsonResponse(
+                {
+                    error: "CDX upstream request timed out or failed before a response was returned.",
+                    status: 504,
+                    target: plan.target,
+                    mode: plan.mode,
+                    detail: error?.message || "fetch failed",
+                    suggestion: "Use a narrower url target, add from/to date bounds, or reduce limit to 5.",
+                },
+                504,
+                corsHeaders,
+                {
+                    "Cache-Control": "no-store",
+                }
+            );
+        }
     }
 
     if ([429, 500, 502, 503, 504].includes(upstreamResponse.status)) {
+        const retryPlan = makeRetryPlan(plan);
+
+        if (retryPlan) {
+            try {
+                const retryResponse = await requestCdx(retryPlan, request, RETRY_TIMEOUT_MS);
+                if (![429, 500, 502, 503, 504].includes(retryResponse.status)) {
+                    upstreamResponse = retryResponse;
+                    plan = retryPlan;
+                }
+            } catch {
+                // Fall through to the structured overload response below.
+            }
+        }
+
+        if (![429, 500, 502, 503, 504].includes(upstreamResponse.status)) {
+            const responseHeaders = makeResponseHeaders(upstreamResponse, corsHeaders, plan);
+            responseHeaders.set("X-AML-Cache", "MISS");
+            responseHeaders.set("X-AML-Retry", "limit-reduced");
+
+            return new Response(request.method === "HEAD" ? null : upstreamResponse.body, {
+                status: upstreamResponse.status,
+                statusText: upstreamResponse.statusText,
+                headers: responseHeaders,
+            });
+        }
+
         return makeOverloadError(upstreamResponse, plan, corsHeaders);
     }
 
