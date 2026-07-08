@@ -1,249 +1,194 @@
-const ALLOWED_TARGET_HOSTS = [
-    "archive.org",
-    "web.archive.org",
-];
-
-const ALLOWED_WAYBACK_PATHS = new Set([
-    "/cdx/search/cdx",
-    "/wayback/available",
-    "/wayback/v1/available",
-]);
-
-const MAX_CDX_LIMIT = 100;
-
-function isAllowedWaybackHost(hostname) {
-    const host = String(hostname || "").toLowerCase();
-    return ALLOWED_TARGET_HOSTS.includes(host);
+function normalizeWaybackInput(value = "") {
+    return normalizeText(value)
+        .replace(/[<>"']/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300);
 }
 
-function isAllowedWaybackPath(targetUrl) {
-    const path = String(targetUrl?.pathname || "");
-    return ALLOWED_WAYBACK_PATHS.has(path);
+function stripWaybackProtocol(value = "") {
+    return String(value || "")
+        .trim()
+        .replace(/^https?:\/\//i, "")
+        .replace(/^web\.archive\.org\/web\/\d+(?:id_)?\//i, "")
+        .replace(/^\*\./, "")
+        .replace(/\*+$/g, "")
+        .trim();
 }
 
-function isAllowedCorsOrigin(origin) {
-    const cleanOrigin = String(origin || "").replace(/\/$/, "");
-
-    const allowedOrigins = new Set([
-        "https://suiteofficelab.com",
-        "https://audiomasterlab.com",
-        "https://www.audiomasterlab.com",
-        "https://videomasterlab.com",
-        "https://videowebsite.unusualsuspectsclothing.workers.dev",
-        "https://imagemasterlab.com",
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-        "http://127.0.0.1:5173",
-    ]);
-
-    const localDevOriginPattern =
-        /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::(?:3000|3001|5173))$/i;
-
-    return allowedOrigins.has(cleanOrigin) || localDevOriginPattern.test(cleanOrigin);
+function looksLikeFullWaybackUrl(value = "") {
+    return /^https?:\/\//i.test(String(value || "").trim());
 }
 
-function getCorsHeaders(request) {
-    const origin = String(request.headers.get("Origin") || "").replace(/\/$/, "");
-    const allowedOrigin = isAllowedCorsOrigin(origin)
-        ? origin
-        : "https://audiomasterlab.com";
-
-    return {
-        "Access-Control-Allow-Origin": allowedOrigin,
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers":
-            "Accept, Content-Type, If-None-Match, If-Modified-Since",
-        "Access-Control-Expose-Headers":
-            "Content-Type, Content-Length, ETag, Last-Modified, Cache-Control",
-        "Access-Control-Max-Age": "86400",
-        Vary: "Origin",
-    };
+function clampWaybackLimit(value) {
+    const limit = Number(value);
+    if (!Number.isFinite(limit)) return WAYBACK_DEFAULT_LIMIT;
+    return Math.min(WAYBACK_MAX_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
-function textResponse(message, status, headers) {
-    return new Response(message, {
-        status,
-        headers: {
-            ...headers,
-            "Content-Type": "text/plain; charset=utf-8",
-        },
-    });
-}
+function getHostnameFromWaybackInput(value = "") {
+    const target = normalizeWaybackInput(value)
+        .replace(/^https?:\/\/web\.archive\.org\/web\/\d+(?:id_)?\//i, "")
+        .replace(/^web\.archive\.org\/web\/\d+(?:id_)?\//i, "")
+        .trim();
 
-function normalizeCdxTargetUrl(targetUrl) {
-    const url = new URL(targetUrl.toString());
-
-    // Keep the API predictable for frontend JSON parsing.
-    url.searchParams.set("output", "json");
-    url.searchParams.delete("callback");
-
-    const requestedLimit = Number(url.searchParams.get("limit") || "50");
-    const safeLimit = Number.isFinite(requestedLimit)
-        ? Math.min(MAX_CDX_LIMIT, Math.max(1, Math.floor(requestedLimit)))
-        : 50;
-    url.searchParams.set("limit", String(safeLimit));
-
-    // Default fields are small and useful. Keep caller-provided fl if supplied.
-    if (!url.searchParams.has("fl")) {
-        url.searchParams.set(
-            "fl",
-            "timestamp,original,statuscode,mimetype,digest,length"
-        );
-    }
-
-    return url;
-}
-
-function normalizeAvailabilityTargetUrl(targetUrl) {
-    const url = new URL(targetUrl.toString());
-    url.searchParams.delete("callback");
-
-    const requestedUrl = String(url.searchParams.get("url") || "").trim();
-
-    if (requestedUrl) {
-        // Match the working frontend request format:
-        // https://archive.org/wayback/available?url=audiomasterlab.com
-        // Keep the inner target as domain/path instead of forcing https://domain.
-        const safeTarget = requestedUrl
-            .replace(/^https?:\/\//i, "")
-            .replace(/^web\.archive\.org\/web\/\d+(?:id_)?\//i, "")
-            .replace(/[<>"']/g, "")
-            .replace(/\s+/g, "")
-            .replace(/\/+$/g, "")
-            .slice(0, 500);
-
-        url.searchParams.set("url", safeTarget);
-    }
-
-    return url;
-}
-
-function normalizeWaybackTargetUrl(targetUrl) {
-    const host = targetUrl.hostname.toLowerCase();
-    const path = targetUrl.pathname;
-    const isCdx = host === "web.archive.org" && path === "/cdx/search/cdx";
-    const isAvailability =
-        host === "archive.org" &&
-        (path === "/wayback/available" || path === "/wayback/v1/available");
-
-    if (isCdx) return normalizeCdxTargetUrl(targetUrl);
-    if (isAvailability) return normalizeAvailabilityTargetUrl(targetUrl);
-
-    const url = new URL(targetUrl.toString());
-    url.searchParams.delete("callback");
-    return url;
-}
-
-export async function onRequest(context) {
-    const { request } = context;
-    const corsHeaders = getCorsHeaders(request);
-
-    if (request.method === "OPTIONS") {
-        return new Response(null, {
-            status: 204,
-            headers: corsHeaders,
-        });
-    }
-
-    if (request.method !== "GET" && request.method !== "HEAD") {
-        return textResponse("Method not allowed", 405, corsHeaders);
-    }
-
-    const requestUrl = new URL(request.url);
-    const rawTargetUrl = requestUrl.searchParams.get("url");
-
-    if (!rawTargetUrl) {
-        return textResponse("Missing ?url=", 400, corsHeaders);
-    }
-
-    let targetUrl;
+    if (!target) return "";
 
     try {
-        targetUrl = new URL(rawTargetUrl);
+        const parsedUrl = new URL(looksLikeFullWaybackUrl(target) ? target : `https://${target}`);
+        return parsedUrl.hostname
+            .replace(/^\*\./, "")
+            .replace(/[^a-z0-9.-]/gi, "")
+            .replace(/\.+$/g, "")
+            .toLowerCase()
+            .trim();
     } catch {
-        return textResponse("Invalid target URL", 400, corsHeaders);
+        return stripWaybackProtocol(target)
+            .split(/[/?#]/)[0]
+            .replace(/^\*\./, "")
+            .replace(/[^a-z0-9.-]/gi, "")
+            .replace(/\.+$/g, "")
+            .toLowerCase()
+            .trim();
+    }
+}
+
+function normalizeWaybackUrlForAvailability(value = "") {
+    // Domain-only for now:
+    // https://archive.org/wayback/available?url=audiomasterlab.com
+    return getHostnameFromWaybackInput(value);
+}
+
+function normalizeWaybackTargetForCdx(value = "", matchType = "domain") {
+    const target = normalizeWaybackInput(value);
+    if (!target) return "";
+
+    if (matchType === "exact") {
+        if (looksLikeFullWaybackUrl(target)) return target;
+
+        const stripped = stripWaybackProtocol(target).replace(/\*+$/g, "");
+        return stripped ? `https://${stripped}` : "";
     }
 
-    if (targetUrl.protocol !== "https:") {
-        return textResponse("Only HTTPS URLs are allowed", 400, corsHeaders);
+    if (matchType === "prefix") {
+        const stripped = stripWaybackProtocol(target)
+            .replace(/^\*\./, "")
+            .replace(/\*+$/g, "")
+            .trim();
+
+        if (!stripped) return "";
+        return stripped.includes("/") ? stripped : `${stripped}/`;
     }
 
-    if (!isAllowedWaybackHost(targetUrl.hostname)) {
-        return textResponse("Target host is not allowed", 403, corsHeaders);
+    return getHostnameFromWaybackInput(target);
+}
+
+function buildWaybackCdxApiUrl({
+    query,
+    matchType = "domain",
+    limit = WAYBACK_DEFAULT_LIMIT,
+    onlyStatus200 = true,
+    collapse = "digest",
+}) {
+    const safeMatchType = ["exact", "prefix", "host", "domain"].includes(matchType)
+        ? matchType
+        : "domain";
+
+    const target = normalizeWaybackTargetForCdx(query, safeMatchType);
+    if (!target) throw new Error("Type a domain or URL for the Wayback/CDX query first.");
+
+    const apiUrl = new URL(WAYBACK_CDX_API_URL);
+    const params = new URLSearchParams();
+
+    params.set("url", target);
+    params.set("output", "json");
+    params.set("matchType", safeMatchType);
+    params.set("fl", "timestamp,original,statuscode,mimetype,digest,length");
+    params.set("limit", String(clampWaybackLimit(limit)));
+    params.set("gzip", "false");
+
+    if (onlyStatus200) params.append("filter", "statuscode:200");
+
+    if (collapse && collapse !== "none") {
+        params.set("collapse", collapse);
     }
 
-    if (!isAllowedWaybackPath(targetUrl)) {
-        return textResponse("Target Wayback path is not allowed", 403, corsHeaders);
+    apiUrl.search = params.toString();
+    return apiUrl.toString();
+}
+
+function buildWaybackAvailabilityApiUrl({ query }) {
+    const target = normalizeWaybackUrlForAvailability(query);
+    if (!target) throw new Error("Type a domain for the Wayback snapshot lookup first.");
+
+    const apiUrl = new URL(WAYBACK_AVAILABLE_API_URL);
+
+    // No timestamp, no collection, no extra params for now.
+    apiUrl.searchParams.set("url", target);
+
+    return apiUrl.toString();
+}
+
+function isWaybackProxyRequestUrl(value = "") {
+    try {
+        const baseUrl =
+            typeof window !== "undefined"
+                ? window.location.origin
+                : "https://suiteofficelab.com";
+
+        const parsedUrl = new URL(value, baseUrl);
+
+        return WAYBACK_PROXY_ENDPOINTS.some((proxyEndpoint) => {
+            const proxyUrl = new URL(proxyEndpoint, baseUrl);
+
+            return (
+                parsedUrl.hostname === proxyUrl.hostname &&
+                parsedUrl.pathname === proxyUrl.pathname
+            );
+        });
+    } catch {
+        return false;
+    }
+}
+
+function buildWaybackProxyRequestUrl(proxyEndpoint, targetUrl) {
+    const cleanTargetUrl = String(targetUrl || "").trim();
+    if (!cleanTargetUrl) return "";
+
+    // Prevent double proxy nesting.
+    if (isWaybackProxyRequestUrl(cleanTargetUrl)) {
+        return cleanTargetUrl;
     }
 
-    const normalizedTargetUrl = normalizeWaybackTargetUrl(targetUrl);
-    const upstreamHeaders = new Headers();
+    const baseUrl =
+        typeof window !== "undefined"
+            ? window.location.origin
+            : "https://suiteofficelab.com";
 
-    const accept = request.headers.get("Accept");
-    upstreamHeaders.set("Accept", accept || "application/json,text/plain,*/*");
+    const proxyUrl = new URL(proxyEndpoint, baseUrl);
+    proxyUrl.searchParams.set("url", cleanTargetUrl);
 
-    const ifNoneMatch = request.headers.get("If-None-Match");
-    if (ifNoneMatch) upstreamHeaders.set("If-None-Match", ifNoneMatch);
+    return proxyUrl.toString();
+}
 
-    const ifModifiedSince = request.headers.get("If-Modified-Since");
-    if (ifModifiedSince) {
-        upstreamHeaders.set("If-Modified-Since", ifModifiedSince);
-    }
+function buildWaybackRequestAttempts(targetUrl) {
+    const seen = new Set();
 
-    const upstreamResponse = await fetch(normalizedTargetUrl.toString(), {
-        method: request.method,
-        headers: upstreamHeaders,
-        redirect: "follow",
+    const attempts = WAYBACK_PROXY_ENDPOINTS.map((proxyEndpoint, index) => ({
+        url: buildWaybackProxyRequestUrl(proxyEndpoint, targetUrl),
+        label:
+            index === 0
+                ? "scrapewebsite /api/waybackproxy"
+                : "waybackproxy fallback",
+    }));
+
+    return attempts.filter((attempt) => {
+        if (!attempt?.url || seen.has(attempt.url)) return false;
+        seen.add(attempt.url);
+        return true;
     });
+}
 
-    if (!upstreamResponse.ok) {
-        let upstreamText = "";
-
-        try {
-            upstreamText = await upstreamResponse.text();
-        } catch {
-            upstreamText = "";
-        }
-
-        return new Response(
-            JSON.stringify(
-                {
-                    error: "Wayback upstream request failed",
-                    upstreamStatus: upstreamResponse.status,
-                    upstreamStatusText: upstreamResponse.statusText,
-                    targetUrl: normalizedTargetUrl.toString(),
-                    upstreamBody: upstreamText.slice(0, 1200),
-                },
-                null,
-                2
-            ),
-            {
-                status: upstreamResponse.status,
-                headers: {
-                    ...corsHeaders,
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Cache-Control": "no-store",
-                },
-            }
-        );
-    }
-
-    const responseHeaders = new Headers(upstreamResponse.headers);
-    responseHeaders.delete("Set-Cookie");
-    responseHeaders.delete("Cookie");
-
-    for (const [key, value] of Object.entries(corsHeaders)) {
-        responseHeaders.set(key, value);
-    }
-
-    responseHeaders.set("Cache-Control", "public, max-age=900, s-maxage=3600");
-
-    return new Response(upstreamResponse.body, {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        headers: responseHeaders,
-    });
+function getPrimaryWaybackRequestUrl(targetUrl) {
+    return buildWaybackRequestAttempts(targetUrl)[0]?.url || targetUrl || "";
 }
