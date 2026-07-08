@@ -21,8 +21,8 @@ function isAllowedWaybackPath(targetUrl) {
     return ALLOWED_WAYBACK_PATHS.has(path);
 }
 
-function getCorsHeaders(request) {
-    const origin = request.headers.get("Origin") || "";
+function isAllowedCorsOrigin(origin) {
+    const cleanOrigin = String(origin || "").replace(/\/$/, "");
 
     const allowedOrigins = new Set([
         "https://suiteofficelab.com",
@@ -34,12 +34,25 @@ function getCorsHeaders(request) {
         "http://localhost:3000",
         "http://localhost:3001",
         "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:5173",
     ]);
 
+    const localDevOriginPattern =
+        /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::(?:3000|3001|5173))$/i;
+
+    return allowedOrigins.has(cleanOrigin) || localDevOriginPattern.test(cleanOrigin);
+}
+
+function getCorsHeaders(request) {
+    const origin = String(request.headers.get("Origin") || "").replace(/\/$/, "");
+    const allowedOrigin = isAllowedCorsOrigin(origin)
+        ? origin
+        : "https://audiomasterlab.com";
+
     return {
-        "Access-Control-Allow-Origin": allowedOrigins.has(origin)
-            ? origin
-            : "https://audiomasterlab.com",
+        "Access-Control-Allow-Origin": allowedOrigin,
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers":
             "Accept, Content-Type, If-None-Match, If-Modified-Since",
@@ -84,12 +97,40 @@ function normalizeCdxTargetUrl(targetUrl) {
     return url;
 }
 
+function normalizeAvailabilityTargetUrl(targetUrl) {
+    const url = new URL(targetUrl.toString());
+    url.searchParams.delete("callback");
+
+    const requestedUrl = String(url.searchParams.get("url") || "").trim();
+
+    if (requestedUrl) {
+        // Match the working frontend request format:
+        // https://archive.org/wayback/available?url=audiomasterlab.com
+        // Keep the inner target as domain/path instead of forcing https://domain.
+        const safeTarget = requestedUrl
+            .replace(/^https?:\/\//i, "")
+            .replace(/^web\.archive\.org\/web\/\d+(?:id_)?\//i, "")
+            .replace(/[<>"']/g, "")
+            .replace(/\s+/g, "")
+            .replace(/\/+$/g, "")
+            .slice(0, 500);
+
+        url.searchParams.set("url", safeTarget);
+    }
+
+    return url;
+}
+
 function normalizeWaybackTargetUrl(targetUrl) {
-    const isCdx =
-        targetUrl.hostname.toLowerCase() === "web.archive.org" &&
-        targetUrl.pathname === "/cdx/search/cdx";
+    const host = targetUrl.hostname.toLowerCase();
+    const path = targetUrl.pathname;
+    const isCdx = host === "web.archive.org" && path === "/cdx/search/cdx";
+    const isAvailability =
+        host === "archive.org" &&
+        (path === "/wayback/available" || path === "/wayback/v1/available");
 
     if (isCdx) return normalizeCdxTargetUrl(targetUrl);
+    if (isAvailability) return normalizeAvailabilityTargetUrl(targetUrl);
 
     const url = new URL(targetUrl.toString());
     url.searchParams.delete("callback");
@@ -157,6 +198,38 @@ export async function onRequest(context) {
         headers: upstreamHeaders,
         redirect: "follow",
     });
+
+    if (!upstreamResponse.ok) {
+        let upstreamText = "";
+
+        try {
+            upstreamText = await upstreamResponse.text();
+        } catch {
+            upstreamText = "";
+        }
+
+        return new Response(
+            JSON.stringify(
+                {
+                    error: "Wayback upstream request failed",
+                    upstreamStatus: upstreamResponse.status,
+                    upstreamStatusText: upstreamResponse.statusText,
+                    targetUrl: normalizedTargetUrl.toString(),
+                    upstreamBody: upstreamText.slice(0, 1200),
+                },
+                null,
+                2
+            ),
+            {
+                status: upstreamResponse.status,
+                headers: {
+                    ...corsHeaders,
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Cache-Control": "no-store",
+                },
+            }
+        );
+    }
 
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.delete("Set-Cookie");
