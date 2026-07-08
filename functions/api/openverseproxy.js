@@ -23,9 +23,14 @@ function getCorsHeaders(request) {
     const origin = request.headers.get("Origin") || "";
 
     const allowedOrigins = new Set([
+        "https://suiteofficelab.com",
         "https://audiomasterlab.com",
         "https://www.audiomasterlab.com",
+        "https://videomasterlab.com",
+        "https://videowebsite.unusualsuspectsclothing.workers.dev",
+        "https://imagemasterlab.com",
         "http://localhost:3000",
+        "http://localhost:3001",
         "http://localhost:5173",
     ]);
 
