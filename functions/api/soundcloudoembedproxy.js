@@ -1,184 +1,231 @@
-const ALLOWED_TARGET_HOSTS = [
-    "soundcloud.com",
-    "www.soundcloud.com",
-];
+const ALLOWED_ORIGINS = new Set([
+    "https://suiteofficelab.com",
+    "https://audiomasterlab.com",
+    "https://www.audiomasterlab.com",
+    "https://videomasterlab.com",
+    "https://videowebsite.unusualsuspectsclothing.workers.dev",
+    "https://imagemasterlab.com",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+]);
 
-const ALLOWED_SOUNDCLOUD_CONTENT_HOSTS = [
-    "soundcloud.com",
-    "www.soundcloud.com",
-];
-
-function isAllowedSoundCloudOembedHost(hostname) {
-    const host = String(hostname || "").toLowerCase();
-    return ALLOWED_TARGET_HOSTS.includes(host);
-}
-
-function isAllowedSoundCloudContentUrl(rawUrl) {
-    if (!rawUrl) return false;
-
-    let contentUrl;
-
-    try {
-        contentUrl = new URL(rawUrl);
-    } catch {
-        return false;
-    }
-
-    if (contentUrl.protocol !== "https:") {
-        return false;
-    }
-
-    const host = contentUrl.hostname.toLowerCase();
-
-    if (!ALLOWED_SOUNDCLOUD_CONTENT_HOSTS.includes(host)) {
-        return false;
-    }
-
-    // Allows profile, track, and set URLs:
-    // https://soundcloud.com/artist
-    // https://soundcloud.com/artist/track
-    // https://soundcloud.com/artist/sets/playlist
-    return /^\/[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)*(\/)?$/.test(contentUrl.pathname);
-}
-
-function isAllowedSoundCloudOembedPath(targetUrl) {
-    if (targetUrl.pathname !== "/oembed") {
-        return false;
-    }
-
-    const format = targetUrl.searchParams.get("format");
-    if (format && format !== "json") {
-        return false;
-    }
-
-    const contentUrl = targetUrl.searchParams.get("url");
-    return isAllowedSoundCloudContentUrl(contentUrl);
-}
-
-function getCorsHeaders(request) {
+function corsHeaders(request) {
     const origin = request.headers.get("Origin") || "";
-
-    const allowedOrigins = new Set([
-        "https://suiteofficelab.com",
-        "https://audiomasterlab.com",
-        "https://www.audiomasterlab.com",
-        "https://videomasterlab.com",
-        "https://videowebsite.unusualsuspectsclothing.workers.dev",
-        "https://imagemasterlab.com",
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",
-    ]);
+    const allowedOrigin = ALLOWED_ORIGINS.has(origin)
+        ? origin
+        : "https://audiomasterlab.com";
 
     return {
-        "Access-Control-Allow-Origin": allowedOrigins.has(origin)
-            ? origin
-            : "https://audiomasterlab.com",
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers":
-            "Accept, Content-Type, If-None-Match, If-Modified-Since",
-        "Access-Control-Expose-Headers":
-            "Content-Type, Content-Length, ETag, Last-Modified, Cache-Control",
+        "Access-Control-Allow-Origin": allowedOrigin,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Accept",
+        "Access-Control-Expose-Headers": "Content-Type, Cache-Control, X-Proxy-Target-URL",
         "Access-Control-Max-Age": "86400",
         Vary: "Origin",
     };
 }
 
-export async function onRequest(context) {
-    const { request } = context;
-    const corsHeaders = getCorsHeaders(request);
+function json(data, status, request, cacheControl = "no-store") {
+    return new Response(JSON.stringify(data, null, 2), {
+        status,
+        headers: {
+            ...corsHeaders(request),
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": cacheControl,
+        },
+    });
+}
 
-    if (request.method === "OPTIONS") {
-        return new Response(null, {
-            status: 204,
-            headers: corsHeaders,
-        });
+function isAllowedSoundCloudContentUrl(contentUrl) {
+    const host = contentUrl.hostname.toLowerCase();
+
+    if (
+        host !== "soundcloud.com" &&
+        host !== "www.soundcloud.com" &&
+        host !== "m.soundcloud.com" &&
+        host !== "on.soundcloud.com"
+    ) {
+        return false;
     }
 
-    if (request.method !== "GET" && request.method !== "HEAD") {
-        return new Response("Method not allowed", {
-            status: 405,
-            headers: corsHeaders,
-        });
-    }
+    if (contentUrl.pathname.includes("..")) return false;
 
-    const requestUrl = new URL(request.url);
-    const rawTargetUrl = requestUrl.searchParams.get("url");
+    return contentUrl.pathname.split("/").filter(Boolean).length >= 1;
+}
 
-    if (!rawTargetUrl) {
-        return new Response("Missing ?url=", {
-            status: 400,
-            headers: corsHeaders,
-        });
-    }
-
-    let targetUrl;
+function normalizeSoundCloudOembedTarget(raw) {
+    let incoming;
 
     try {
-        targetUrl = new URL(rawTargetUrl);
+        incoming = new URL(raw);
     } catch {
-        return new Response("Invalid target URL", {
-            status: 400,
-            headers: corsHeaders,
+        throw new Error("Invalid ?url= parameter.");
+    }
+
+    const host = incoming.hostname.toLowerCase();
+
+    if (host === "soundcloud.com" && incoming.pathname === "/oembed") {
+        const inner = incoming.searchParams.get("url");
+
+        if (!inner) {
+            throw new Error("SoundCloud oEmbed URL is missing its inner url= parameter.");
+        }
+
+        const contentUrl = new URL(inner);
+
+        if (!isAllowedSoundCloudContentUrl(contentUrl)) {
+            throw new Error("Inner SoundCloud URL is not allowed.");
+        }
+
+        const target = new URL("https://soundcloud.com/oembed");
+        target.searchParams.set("format", "json");
+        target.searchParams.set("url", contentUrl.toString());
+        return { target, contentUrl };
+    }
+
+    if (!isAllowedSoundCloudContentUrl(incoming)) {
+        throw new Error("Only SoundCloud content URLs or https://soundcloud.com/oembed URLs are allowed.");
+    }
+
+    const target = new URL("https://soundcloud.com/oembed");
+    target.searchParams.set("format", "json");
+    target.searchParams.set("url", incoming.toString());
+    return { target, contentUrl: incoming };
+}
+
+function fallbackSoundCloudOembed(contentUrl, reason = "") {
+    const playerUrl = `https://w.soundcloud.com/player/?url=${encodeURIComponent(
+        contentUrl.toString()
+    )}&color=%23ff5500&auto_play=false&hide_related=false&show_comments=false&show_user=true&show_reposts=false&show_teaser=true&visual=true`;
+
+    return {
+        ok: true,
+        fallback: true,
+        reason,
+        version: "1.0",
+        type: "rich",
+        provider_name: "SoundCloud",
+        provider_url: "https://soundcloud.com",
+        title: "SoundCloud preview",
+        author_name: "SoundCloud",
+        thumbnail_url: "https://audiomasterlab.com/social-preview.png",
+        html: `<iframe width="100%" height="450" scrolling="no" frameborder="no" allow="autoplay" src="${playerUrl}"></iframe>`,
+    };
+}
+
+export async function onRequestOptions({ request }) {
+    return new Response(null, { status: 204, headers: corsHeaders(request) });
+}
+
+export async function onRequestGet({ request }) {
+    const requestUrl = new URL(request.url);
+    const raw = requestUrl.searchParams.get("url");
+
+    if (!raw) {
+        return json(
+            {
+                error: "Missing ?url= parameter",
+                example:
+                    "/api/soundcloudoembedproxy?url=https%3A%2F%2Fsoundcloud.com%2Foembed%3Fformat%3Djson%26url%3Dhttps%253A%252F%252Fsoundcloud.com%252Fforss%252Fflickermood",
+            },
+            400,
+            request
+        );
+    }
+
+    let target;
+    let contentUrl;
+
+    try {
+        const normalized = normalizeSoundCloudOembedTarget(raw);
+        target = normalized.target;
+        contentUrl = normalized.contentUrl;
+    } catch (error) {
+        return json(
+            {
+                error: "Bad SoundCloud oEmbed proxy request",
+                message: error?.message || String(error),
+            },
+            400,
+            request
+        );
+    }
+
+    try {
+        const upstream = await fetch(target.toString(), {
+            headers: {
+                Accept: "application/json, text/plain, */*",
+                "User-Agent": "AudioMasterLabSoundCloudOEmbedProxy/1.0 (+https://audiomasterlab.com/news)",
+            },
+            cf: {
+                cacheTtl: 3600,
+                cacheEverything: true,
+            },
         });
+
+        const body = await upstream.text();
+
+        if (!upstream.ok) {
+            return json(
+                {
+                    ...fallbackSoundCloudOembed(
+                        contentUrl,
+                        `SoundCloud oEmbed upstream returned ${upstream.status}.`
+                    ),
+                    upstreamStatus: upstream.status,
+                    upstreamStatusText: upstream.statusText || "<none>",
+                    upstreamPreview: body.slice(0, 600),
+                },
+                200,
+                request,
+                "public, max-age=900, s-maxage=3600"
+            );
+        }
+
+        if (/<!doctype html|<html|<div id=["']root["']><\/div>/i.test(body)) {
+            return json(
+                fallbackSoundCloudOembed(
+                    contentUrl,
+                    "SoundCloud oEmbed returned HTML instead of JSON."
+                ),
+                200,
+                request,
+                "public, max-age=900, s-maxage=3600"
+            );
+        }
+
+        let data;
+
+        try {
+            data = JSON.parse(body);
+        } catch {
+            return json(
+                fallbackSoundCloudOembed(
+                    contentUrl,
+                    "SoundCloud oEmbed returned invalid JSON."
+                ),
+                200,
+                request,
+                "public, max-age=900, s-maxage=3600"
+            );
+        }
+
+        return json(
+            {
+                ok: true,
+                ...data,
+            },
+            200,
+            request,
+            "public, max-age=900, s-maxage=3600"
+        );
+    } catch (error) {
+        return json(
+            fallbackSoundCloudOembed(contentUrl, error?.message || String(error)),
+            200,
+            request,
+            "public, max-age=900, s-maxage=3600"
+        );
     }
-
-    if (targetUrl.protocol !== "https:") {
-        return new Response("Only HTTPS URLs are allowed", {
-            status: 400,
-            headers: corsHeaders,
-        });
-    }
-
-    if (!isAllowedSoundCloudOembedHost(targetUrl.hostname)) {
-        return new Response("Target host is not allowed", {
-            status: 403,
-            headers: corsHeaders,
-        });
-    }
-
-    if (!isAllowedSoundCloudOembedPath(targetUrl)) {
-        return new Response("Target SoundCloud oEmbed URL is not allowed", {
-            status: 403,
-            headers: corsHeaders,
-        });
-    }
-
-    const upstreamHeaders = new Headers();
-
-    upstreamHeaders.set(
-        "User-Agent",
-        "AudioMasterLab/1.0 (+https://audiomasterlab.com)"
-    );
-    upstreamHeaders.set("Accept", request.headers.get("Accept") || "application/json");
-
-    const ifNoneMatch = request.headers.get("If-None-Match");
-    if (ifNoneMatch) upstreamHeaders.set("If-None-Match", ifNoneMatch);
-
-    const ifModifiedSince = request.headers.get("If-Modified-Since");
-    if (ifModifiedSince) {
-        upstreamHeaders.set("If-Modified-Since", ifModifiedSince);
-    }
-
-    const upstreamResponse = await fetch(targetUrl.toString(), {
-        method: request.method,
-        headers: upstreamHeaders,
-        redirect: "follow",
-    });
-
-    const responseHeaders = new Headers(upstreamResponse.headers);
-
-    responseHeaders.delete("Set-Cookie");
-
-    for (const [key, value] of Object.entries(corsHeaders)) {
-        responseHeaders.set(key, value);
-    }
-
-    responseHeaders.set("Cache-Control", "public, max-age=86400");
-
-    return new Response(upstreamResponse.body, {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        headers: responseHeaders,
-    });
 }

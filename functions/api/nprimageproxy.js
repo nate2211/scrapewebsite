@@ -1,4 +1,8 @@
-const ALLOWED_TARGET_HOSTS = new Set(["feeds.npr.org"]);
+const ALLOWED_TARGET_HOSTS = new Set([
+    "media.npr.org",
+    "npr.brightspotcdn.com",
+    "npr-brightspot.s3.amazonaws.com",
+]);
 
 const ALLOWED_ORIGINS = new Set([
     "https://suiteofficelab.com",
@@ -28,47 +32,48 @@ function corsHeaders(request) {
     };
 }
 
-function json(data, status, request, cacheControl = "no-store") {
+function json(data, status, request) {
     return new Response(JSON.stringify(data, null, 2), {
         status,
         headers: {
             ...corsHeaders(request),
             "Content-Type": "application/json; charset=utf-8",
-            "Cache-Control": cacheControl,
-        },
-    });
-}
-
-function text(body, status, request, contentType = "text/plain; charset=utf-8", cacheControl = "no-store") {
-    return new Response(body, {
-        status,
-        headers: {
-            ...corsHeaders(request),
-            "Content-Type": contentType,
-            "Cache-Control": cacheControl,
+            "Cache-Control": "no-store",
         },
     });
 }
 
 function isAllowedTarget(targetUrl) {
-    if (targetUrl.protocol !== "https:") return false;
-    if (!ALLOWED_TARGET_HOSTS.has(targetUrl.hostname.toLowerCase())) return false;
-    return /^\/\d+\/rss\.xml$/i.test(targetUrl.pathname);
+    if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") return false;
+
+    const host = targetUrl.hostname.toLowerCase();
+
+    if (!ALLOWED_TARGET_HOSTS.has(host)) return false;
+
+    if (targetUrl.pathname.includes("..")) return false;
+
+    const pathLooksImage = /\.(jpg|jpeg|png|webp|gif|avif)$/i.test(targetUrl.pathname);
+    const isBrightspotDims = host === "npr.brightspotcdn.com" && targetUrl.pathname.startsWith("/dims3/");
+
+    return pathLooksImage || isBrightspotDims;
 }
 
 function getTargetUrl(request) {
     const requestUrl = new URL(request.url);
-    const raw = requestUrl.searchParams.get("url") || "https://feeds.npr.org/1039/rss.xml";
+    const raw = requestUrl.searchParams.get("url");
+
+    if (!raw) throw new Error("Missing ?url= parameter.");
 
     let targetUrl;
+
     try {
         targetUrl = new URL(raw);
     } catch {
-        throw new Error("Invalid ?url= parameter.");
+        throw new Error("Invalid target URL.");
     }
 
     if (!isAllowedTarget(targetUrl)) {
-        throw new Error("Only NPR RSS feed URLs like https://feeds.npr.org/1039/rss.xml are allowed.");
+        throw new Error("Only NPR image CDN URLs are allowed.");
     }
 
     targetUrl.hash = "";
@@ -91,7 +96,7 @@ export async function onRequestGet({ request, headOnly = false }) {
     } catch (error) {
         return json(
             {
-                error: "Bad NPR RSS proxy request",
+                error: "Bad NPR image proxy request",
                 message: error?.message || String(error),
             },
             400,
@@ -99,38 +104,58 @@ export async function onRequestGet({ request, headOnly = false }) {
         );
     }
 
-    const upstreamHeaders = new Headers({
-        Accept: "application/rss+xml, application/xml, text/xml, */*",
-        "User-Agent": "AudioMasterLabRSSProxy/1.0 (+https://audiomasterlab.com/news)",
-    });
-
-    const ifNoneMatch = request.headers.get("If-None-Match");
-    if (ifNoneMatch) upstreamHeaders.set("If-None-Match", ifNoneMatch);
-
-    const ifModifiedSince = request.headers.get("If-Modified-Since");
-    if (ifModifiedSince) upstreamHeaders.set("If-Modified-Since", ifModifiedSince);
-
     try {
         const upstream = await fetch(targetUrl.toString(), {
             method: headOnly ? "HEAD" : "GET",
-            headers: upstreamHeaders,
+            headers: {
+                Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "User-Agent": "AudioMasterLabImageProxy/1.0 (+https://audiomasterlab.com/news)",
+            },
             redirect: "follow",
             cf: {
-                cacheTtl: 900,
+                cacheTtl: 86400,
                 cacheEverything: true,
             },
         });
 
         const headers = new Headers(upstream.headers);
         headers.delete("Set-Cookie");
+        headers.delete("Content-Security-Policy");
+        headers.delete("X-Frame-Options");
 
         for (const [key, value] of Object.entries(corsHeaders(request))) {
             headers.set(key, value);
         }
 
-        headers.set("Content-Type", "application/rss+xml; charset=utf-8");
-        headers.set("Cache-Control", "public, max-age=300, s-maxage=900");
+        headers.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
         headers.set("X-Proxy-Target-URL", targetUrl.toString());
+
+        const contentType = upstream.headers.get("Content-Type") || "";
+        if (!contentType.toLowerCase().startsWith("image/")) {
+            return json(
+                {
+                    error: "NPR image upstream did not return an image",
+                    upstreamStatus: upstream.status,
+                    contentType,
+                    targetUrl: targetUrl.toString(),
+                },
+                502,
+                request
+            );
+        }
+
+        if (!upstream.ok) {
+            return json(
+                {
+                    error: "NPR image upstream failed",
+                    upstreamStatus: upstream.status,
+                    upstreamStatusText: upstream.statusText || "<none>",
+                    targetUrl: targetUrl.toString(),
+                },
+                502,
+                request
+            );
+        }
 
         if (headOnly) {
             return new Response(null, {
@@ -140,42 +165,15 @@ export async function onRequestGet({ request, headOnly = false }) {
             });
         }
 
-        const body = await upstream.text();
-
-        if (!upstream.ok) {
-            return json(
-                {
-                    error: "NPR RSS upstream request failed",
-                    upstreamStatus: upstream.status,
-                    upstreamStatusText: upstream.statusText || "<none>",
-                    targetUrl: targetUrl.toString(),
-                    preview: body.slice(0, 600),
-                },
-                502,
-                request
-            );
-        }
-
-        if (/<!doctype html|<html|<div id=["']root["']><\/div>/i.test(body)) {
-            return json(
-                {
-                    error: "NPR RSS upstream returned HTML instead of RSS XML",
-                    targetUrl: targetUrl.toString(),
-                    preview: body.slice(0, 600),
-                },
-                502,
-                request
-            );
-        }
-
-        return new Response(body, {
-            status: 200,
+        return new Response(upstream.body, {
+            status: upstream.status,
+            statusText: upstream.statusText,
             headers,
         });
     } catch (error) {
         return json(
             {
-                error: "NPR RSS upstream fetch failed",
+                error: "NPR image fetch failed",
                 message: error?.message || String(error),
                 targetUrl: targetUrl.toString(),
             },

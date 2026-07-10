@@ -1,7 +1,4 @@
-const ALLOWED_TARGET_HOSTS = new Set([
-    "www.npr.org",
-    "npr.org",
-]);
+const ALLOWED_TARGET_HOSTS = new Set(["www.npr.org", "npr.org"]);
 
 const ALLOWED_ORIGINS = new Set([
     "https://suiteofficelab.com",
@@ -15,41 +12,7 @@ const ALLOWED_ORIGINS = new Set([
     "http://localhost:5173",
 ]);
 
-function normalizeHost(hostname) {
-    return String(hostname || "").toLowerCase();
-}
-
-function isAllowedNprHost(hostname) {
-    return ALLOWED_TARGET_HOSTS.has(normalizeHost(hostname));
-}
-
-function isAllowedNprArticlePath(targetUrl) {
-    const path = targetUrl.pathname || "";
-
-    if (path === "/" || path === "/sections" || path === "/sections/") {
-        return false;
-    }
-
-    if (path.includes("..")) {
-        return false;
-    }
-
-    // NPR article URLs commonly look like:
-    // /2026/07/09/nx-s1-xxxxx/story-title
-    // /sections/music/2026/07/09/nx-s1-xxxxx/story-title
-    // /2026/7/story-title
-    const articlePatterns = [
-        /^\/\d{4}\/\d{2}\/\d{2}\/[^/]+\/[^/]+\/?$/i,
-        /^\/sections\/[a-z0-9-]+\/\d{4}\/\d{2}\/\d{2}\/[^/]+\/[^/]+\/?$/i,
-        /^\/sections\/[a-z0-9-]+\/\d{4}\/\d{1,2}\/\d{1,2}\/[^/]+\/[^/]+\/?$/i,
-        /^\/\d{4}\/\d{1,2}\/\d{1,2}\/[^/]+\/?$/i,
-        /^\/\d{4}\/\d{1,2}\/[^/]+\/?$/i,
-    ];
-
-    return articlePatterns.some((pattern) => pattern.test(path));
-}
-
-function getCorsHeaders(request) {
+function corsHeaders(request) {
     const origin = request.headers.get("Origin") || "";
     const allowedOrigin = ALLOWED_ORIGINS.has(origin)
         ? origin
@@ -58,83 +21,144 @@ function getCorsHeaders(request) {
     return {
         "Access-Control-Allow-Origin": allowedOrigin,
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers":
-            "Accept, Content-Type, If-None-Match, If-Modified-Since",
-        "Access-Control-Expose-Headers":
-            "Content-Type, Content-Length, ETag, Last-Modified, Cache-Control, X-Proxy-Target-Host",
+        "Access-Control-Allow-Headers": "Content-Type, Accept, If-None-Match, If-Modified-Since",
+        "Access-Control-Expose-Headers": "Content-Type, Cache-Control, ETag, Last-Modified, X-Proxy-Target-URL",
         "Access-Control-Max-Age": "86400",
-        "Vary": "Origin",
+        Vary: "Origin",
     };
 }
 
-function textResponse(message, status, headers) {
-    return new Response(message, {
-        status,
-        headers: {
-            ...headers,
-            "Content-Type": "text/plain; charset=utf-8",
-            "Cache-Control": "no-store",
-        },
-    });
-}
-
-function jsonResponse(data, status, headers, cacheControl = "no-store") {
+function json(data, status, request, cacheControl = "no-store") {
     return new Response(JSON.stringify(data, null, 2), {
         status,
         headers: {
-            ...headers,
+            ...corsHeaders(request),
             "Content-Type": "application/json; charset=utf-8",
             "Cache-Control": cacheControl,
         },
     });
 }
 
-function isHtmlResponse(text) {
-    const value = String(text || "").trim().slice(0, 300).toLowerCase();
+function text(body, status, request, contentType = "text/plain; charset=utf-8") {
+    return new Response(body, {
+        status,
+        headers: {
+            ...corsHeaders(request),
+            "Content-Type": contentType,
+            "Cache-Control": "no-store",
+        },
+    });
+}
+
+function isAllowedNprArticlePath(targetUrl) {
+    const path = targetUrl.pathname || "";
+
+    if (path.includes("..")) return false;
+    if (path === "/" || path === "/sections" || path === "/sections/") return false;
 
     return (
-        value.startsWith("<!doctype html") ||
-        value.startsWith("<html") ||
-        value.includes("<head") ||
-        value.includes("<body")
+        /^\/\d{4}\/\d{1,2}\/\d{1,2}\/[a-z0-9-]+\/[a-z0-9-]+\/?$/i.test(path) ||
+        /^\/sections\/[a-z0-9-]+\/\d{4}\/\d{1,2}\/\d{1,2}\/[a-z0-9-]+\/[a-z0-9-]+\/?$/i.test(path) ||
+        /^\/\d{4}\/\d{1,2}\/\d{1,2}\/\d+\/[a-z0-9-]+\/?$/i.test(path) ||
+        /^\/sections\/[a-z0-9-]+\/\d{4}\/\d{1,2}\/\d{1,2}\/\d+\/[a-z0-9-]+\/?$/i.test(path)
     );
 }
 
-function extractMeta(html, selectors) {
-    for (const selector of selectors) {
-        const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function getTargetUrl(request) {
+    const requestUrl = new URL(request.url);
+    const raw = requestUrl.searchParams.get("url") || requestUrl.searchParams.get("u");
 
-        const propertyRegex = new RegExp(
+    if (!raw) throw new Error("Missing ?url= parameter.");
+
+    let targetUrl;
+
+    try {
+        targetUrl = new URL(raw);
+    } catch {
+        throw new Error("Invalid target URL.");
+    }
+
+    if (targetUrl.protocol !== "https:") {
+        throw new Error("Only HTTPS NPR article URLs are allowed.");
+    }
+
+    if (!ALLOWED_TARGET_HOSTS.has(targetUrl.hostname.toLowerCase())) {
+        throw new Error("Target host is not allowed.");
+    }
+
+    if (!isAllowedNprArticlePath(targetUrl)) {
+        throw new Error("Target NPR article path is not allowed.");
+    }
+
+    targetUrl.hash = "";
+    return targetUrl;
+}
+
+function decodeEntities(value) {
+    return String(value || "")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#039;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&nbsp;/g, " ");
+}
+
+function extractMeta(html, names) {
+    for (const name of names) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regexA = new RegExp(
             `<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`,
             "i"
         );
-
-        const propertyMatch = html.match(propertyRegex);
-        if (propertyMatch?.[1]) {
-            return propertyMatch[1].replace(/&amp;/g, "&").trim();
-        }
-
-        const reverseRegex = new RegExp(
+        const regexB = new RegExp(
             `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`,
             "i"
         );
 
-        const reverseMatch = html.match(reverseRegex);
-        if (reverseMatch?.[1]) {
-            return reverseMatch[1].replace(/&amp;/g, "&").trim();
-        }
+        const match = html.match(regexA) || html.match(regexB);
+        if (match?.[1]) return decodeEntities(match[1].trim());
     }
 
     return "";
 }
 
+function absoluteUrl(value, baseUrl) {
+    const textValue = String(value || "").trim();
+    if (!textValue) return "";
+
+    try {
+        return new URL(textValue, baseUrl).toString();
+    } catch {
+        return "";
+    }
+}
+
+function extractImage(html, baseUrl) {
+    const meta =
+        extractMeta(html, [
+            "og:image",
+            "og:image:url",
+            "twitter:image",
+            "twitter:image:src",
+        ]) || "";
+
+    if (meta) return absoluteUrl(meta, baseUrl);
+
+    const imgMatch = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+    if (imgMatch?.[1]) return absoluteUrl(decodeEntities(imgMatch[1]), baseUrl);
+
+    const loose = html.match(
+        /(https?:\/\/[^\s"'<>]+?\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^\s"'<>]*)?)/i
+    );
+
+    return absoluteUrl(loose?.[1], baseUrl);
+}
+
 function extractTitle(html) {
     return (
         extractMeta(html, ["og:title", "twitter:title"]) ||
-        (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "")
-            .replace(/\s+/g, " ")
-            .replace(/&amp;/g, "&")
-            .trim()
+        decodeEntities((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").replace(/\s+/g, " ").trim())
     );
 }
 
@@ -144,54 +168,6 @@ function extractDescription(html) {
         "twitter:description",
         "description",
     ]);
-}
-
-function extractImage(html) {
-    const metaImage = extractMeta(html, [
-        "og:image",
-        "og:image:url",
-        "twitter:image",
-        "twitter:image:src",
-    ]);
-
-    if (metaImage) return metaImage;
-
-    const jsonLdMatches = html.match(
-        /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-    );
-
-    if (jsonLdMatches) {
-        for (const block of jsonLdMatches) {
-            const jsonText =
-                block.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1] || "";
-
-            try {
-                const data = JSON.parse(jsonText.trim());
-                const list = Array.isArray(data) ? data : [data];
-
-                for (const item of list) {
-                    const imageValue = item?.image;
-                    const candidate =
-                        typeof imageValue === "string"
-                            ? imageValue
-                            : Array.isArray(imageValue)
-                                ? imageValue[0]
-                                : imageValue?.url;
-
-                    if (candidate) return String(candidate).replace(/&amp;/g, "&");
-                }
-            } catch {
-                // Ignore malformed JSON-LD blocks.
-            }
-        }
-    }
-
-    const imgMatch = html.match(/<img[^>]+src=["']([^"']+)["']/i);
-    if (imgMatch?.[1]) {
-        return imgMatch[1].replace(/&amp;/g, "&").trim();
-    }
-
-    return "";
 }
 
 function extractPublishedAt(html) {
@@ -207,191 +183,170 @@ function extractPublishedAt(html) {
     );
 }
 
-function absoluteUrl(value, baseUrl) {
-    const text = String(value || "").trim();
-
-    if (!text) return "";
-
-    try {
-        return new URL(text, baseUrl).toString();
-    } catch {
-        return "";
-    }
+export async function onRequestOptions({ request }) {
+    return new Response(null, { status: 204, headers: corsHeaders(request) });
 }
 
-function getTargetUrlFromRequest(requestUrl) {
-    return requestUrl.searchParams.get("url") || requestUrl.searchParams.get("u");
+export async function onRequestHead({ request }) {
+    return onRequestGet({ request, headOnly: true });
 }
 
-export async function onRequest(context) {
-    const { request } = context;
-    const corsHeaders = getCorsHeaders(request);
-
-    if (request.method === "OPTIONS") {
-        return new Response(null, {
-            status: 204,
-            headers: corsHeaders,
-        });
-    }
-
-    if (request.method !== "GET" && request.method !== "HEAD") {
-        return textResponse("Method not allowed", 405, corsHeaders);
-    }
-
-    const requestUrl = new URL(request.url);
-    const rawTargetUrl = getTargetUrlFromRequest(requestUrl);
-    const wantsJson =
-        requestUrl.searchParams.get("format") === "json" ||
-        requestUrl.searchParams.get("extract") === "1";
-
-    if (!rawTargetUrl) {
-        return textResponse(
-            "Missing ?url=. Example: /api/nprarticleproxy?url=https%3A%2F%2Fwww.npr.org%2F2026%2F07%2F09%2Fexample",
-            400,
-            corsHeaders
-        );
-    }
-
+export async function onRequestGet({ request, headOnly = false }) {
     let targetUrl;
 
     try {
-        targetUrl = new URL(rawTargetUrl);
-    } catch {
-        return textResponse("Invalid target URL", 400, corsHeaders);
+        targetUrl = getTargetUrl(request);
+    } catch (error) {
+        return json(
+            {
+                ok: false,
+                error: "Bad NPR article proxy request",
+                message: error?.message || String(error),
+            },
+            400,
+            request
+        );
     }
 
-    if (targetUrl.protocol !== "https:") {
-        return textResponse("Only HTTPS NPR article URLs are allowed", 400, corsHeaders);
-    }
-
-    if (!isAllowedNprHost(targetUrl.hostname)) {
-        return textResponse("Target host is not allowed", 403, corsHeaders);
-    }
-
-    if (!isAllowedNprArticlePath(targetUrl)) {
-        return textResponse("Target NPR article path is not allowed", 403, corsHeaders);
-    }
-
-    const upstreamHeaders = new Headers();
-
-    upstreamHeaders.set(
-        "User-Agent",
-        "AudioMasterLab-NPRArticleProxy/1.0 (+https://audiomasterlab.com)"
-    );
-
-    upstreamHeaders.set(
-        "Accept",
-        request.headers.get("Accept") ||
-        "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8"
-    );
-
-    const ifNoneMatch = request.headers.get("If-None-Match");
-    if (ifNoneMatch) upstreamHeaders.set("If-None-Match", ifNoneMatch);
-
-    const ifModifiedSince = request.headers.get("If-Modified-Since");
-    if (ifModifiedSince) upstreamHeaders.set("If-Modified-Since", ifModifiedSince);
-
-    let upstreamResponse;
+    const requestUrl = new URL(request.url);
+    const rawMode = requestUrl.searchParams.get("raw") === "1";
+    const wantsJson =
+        requestUrl.searchParams.get("format") === "json" ||
+        requestUrl.searchParams.get("extract") === "1" ||
+        !rawMode;
 
     try {
-        upstreamResponse = await fetch(targetUrl.toString(), {
-            method: request.method,
-            headers: upstreamHeaders,
+        const upstream = await fetch(targetUrl.toString(), {
+            method: headOnly ? "HEAD" : "GET",
+            headers: {
+                Accept:
+                    "text/html, application/xhtml+xml, application/xml;q=0.9, image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent":
+                    "Mozilla/5.0 (compatible; AudioMasterLabNewsBot/1.0; +https://audiomasterlab.com/news)",
+            },
             redirect: "follow",
             cf: {
                 cacheTtl: 900,
                 cacheEverything: true,
             },
         });
-    } catch (error) {
-        return jsonResponse(
-            {
-                error: "NPR article upstream request failed",
-                message: error instanceof Error ? error.message : String(error),
-                targetUrl: targetUrl.toString(),
-            },
-            502,
-            corsHeaders
-        );
-    }
 
-    const contentType = upstreamResponse.headers.get("Content-Type") || "";
-    const responseHeaders = new Headers(upstreamResponse.headers);
+        if (headOnly) {
+            const headers = new Headers(upstream.headers);
+            for (const [key, value] of Object.entries(corsHeaders(request))) {
+                headers.set(key, value);
+            }
+            headers.set("X-Proxy-Target-URL", targetUrl.toString());
 
-    responseHeaders.delete("Set-Cookie");
-    responseHeaders.delete("Content-Security-Policy");
-    responseHeaders.delete("X-Frame-Options");
+            return new Response(null, {
+                status: upstream.status,
+                statusText: upstream.statusText,
+                headers,
+            });
+        }
 
-    for (const [key, value] of Object.entries(corsHeaders)) {
-        responseHeaders.set(key, value);
-    }
+        const html = await upstream.text();
 
-    responseHeaders.set("X-Proxy-Target-Host", targetUrl.hostname);
-    responseHeaders.set("Cache-Control", "public, max-age=900, s-maxage=900");
+        if (!upstream.ok) {
+            if (wantsJson) {
+                return json(
+                    {
+                        ok: false,
+                        source: "npr",
+                        url: targetUrl.toString(),
+                        image: "",
+                        title: "",
+                        description: "",
+                        publishedAt: "",
+                        upstreamStatus: upstream.status,
+                        upstreamStatusText: upstream.statusText || "<none>",
+                        message:
+                            "NPR article page fetch failed. Use the RSS content:encoded image first; do not depend on article-page enrichment.",
+                        preview: html.slice(0, 500),
+                    },
+                    200,
+                    request,
+                    "public, max-age=120, s-maxage=120"
+                );
+            }
 
-    if (!upstreamResponse.ok) {
-        const body = await upstreamResponse.text();
+            return json(
+                {
+                    ok: false,
+                    error: "NPR article upstream returned an error",
+                    upstreamStatus: upstream.status,
+                    upstreamStatusText: upstream.statusText || "<none>",
+                    targetUrl: targetUrl.toString(),
+                    preview: html.slice(0, 500),
+                },
+                502,
+                request
+            );
+        }
 
-        return jsonResponse(
-            {
-                error: "NPR article upstream returned an error",
-                upstreamStatus: upstreamResponse.status,
-                upstreamStatusText: upstreamResponse.statusText,
-                targetUrl: targetUrl.toString(),
-                preview: body.slice(0, 500),
-            },
-            upstreamResponse.status,
-            corsHeaders
-        );
-    }
+        if (wantsJson) {
+            return json(
+                {
+                    ok: true,
+                    source: "npr",
+                    url: targetUrl.toString(),
+                    title: extractTitle(html),
+                    description: extractDescription(html),
+                    image: extractImage(html, targetUrl.toString()),
+                    publishedAt: extractPublishedAt(html),
+                },
+                200,
+                request,
+                "public, max-age=900, s-maxage=900"
+            );
+        }
 
-    if (request.method === "HEAD") {
-        return new Response(null, {
-            status: upstreamResponse.status,
-            statusText: upstreamResponse.statusText,
-            headers: responseHeaders,
+        const headers = new Headers(upstream.headers);
+        headers.delete("Set-Cookie");
+        headers.delete("Content-Security-Policy");
+        headers.delete("X-Frame-Options");
+
+        for (const [key, value] of Object.entries(corsHeaders(request))) {
+            headers.set(key, value);
+        }
+
+        headers.set("Content-Type", "text/html; charset=utf-8");
+        headers.set("Cache-Control", "public, max-age=900, s-maxage=900");
+        headers.set("X-Proxy-Target-URL", targetUrl.toString());
+
+        return new Response(html, {
+            status: 200,
+            headers,
         });
-    }
+    } catch (error) {
+        if (wantsJson) {
+            return json(
+                {
+                    ok: false,
+                    source: "npr",
+                    url: targetUrl.toString(),
+                    image: "",
+                    title: "",
+                    description: "",
+                    publishedAt: "",
+                    message: error?.message || String(error),
+                },
+                200,
+                request,
+                "public, max-age=120, s-maxage=120"
+            );
+        }
 
-    const html = await upstreamResponse.text();
-
-    if (!isHtmlResponse(html) && !contentType.toLowerCase().includes("html")) {
-        return jsonResponse(
+        return json(
             {
-                error: "NPR article upstream did not return HTML",
+                ok: false,
+                error: "NPR article fetch failed",
+                message: error?.message || String(error),
                 targetUrl: targetUrl.toString(),
-                contentType,
-                preview: html.slice(0, 500),
             },
             502,
-            corsHeaders
+            request
         );
     }
-
-    if (wantsJson) {
-        const image = absoluteUrl(extractImage(html), targetUrl.toString());
-
-        return jsonResponse(
-            {
-                ok: true,
-                source: "npr",
-                url: targetUrl.toString(),
-                title: extractTitle(html),
-                description: extractDescription(html),
-                image,
-                publishedAt: extractPublishedAt(html),
-            },
-            200,
-            corsHeaders,
-            "public, max-age=900, s-maxage=900"
-        );
-    }
-
-    responseHeaders.set("Content-Type", "text/html; charset=utf-8");
-
-    return new Response(html, {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        headers: responseHeaders,
-    });
 }
