@@ -1,218 +1,191 @@
-function cors() {
-    return {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Max-Age": "86400",
-    };
-}
-
-function json(data, status = 200) {
+function json(data, status = 200, headers = {}) {
     return new Response(JSON.stringify(data, null, 2), {
         status,
         headers: {
-            "Content-Type": "application/json",
-            ...cors(),
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...headers,
         },
     });
 }
 
-function makeId() {
-    return crypto.randomUUID();
+function getCorsHeaders(request) {
+    const origin = request.headers.get("Origin") || "";
+
+    const allowedOrigins = new Set([
+        "https://suiteofficelab.com",
+        "https://audiomasterlab.com",
+        "https://www.audiomasterlab.com",
+        "https://videomasterlab.com",
+        "https://videowebsite.unusualsuspectsclothing.workers.dev",
+        "https://imagemasterlab.com",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:5173",
+    ]);
+
+    return {
+        "Access-Control-Allow-Origin": allowedOrigins.has(origin)
+            ? origin
+            : "https://audiomasterlab.com",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Accept",
+        "Access-Control-Max-Age": "86400",
+        Vary: "Origin",
+    };
 }
 
-function cleanMethod(method) {
-    const value = String(method || "GET").toUpperCase();
-    const allowed = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
-    return allowed.includes(value) ? value : "GET";
+function normalizeJobs(payload) {
+    if (Array.isArray(payload?.jobs)) {
+        return payload.jobs;
+    }
+
+    if (payload?.url) {
+        return [payload];
+    }
+
+    return [];
 }
 
-function cleanUrl(value) {
+function isQueueFullError(error) {
+    const text = String(
+        error?.message ||
+        error?.stack ||
+        error ||
+        ""
+    ).toLowerCase();
+
+    return (
+        text.includes("queue") ||
+        text.includes("capacity") ||
+        text.includes("quota") ||
+        text.includes("rate") ||
+        text.includes("too many") ||
+        text.includes("limit") ||
+        text.includes("backpressure")
+    );
+}
+
+export async function onRequest(context) {
+    const { request, env } = context;
+    const corsHeaders = getCorsHeaders(request);
+
+    if (request.method === "OPTIONS") {
+        return new Response(null, {
+            status: 204,
+            headers: corsHeaders,
+        });
+    }
+
+    if (request.method !== "POST") {
+        return json(
+            { ok: false, error: "Method not allowed" },
+            405,
+            corsHeaders
+        );
+    }
+
+    let payload;
+
     try {
-        const url = new URL(String(value || "").trim());
-        if (url.protocol !== "https:") return null;
-        return url.toString();
+        payload = await request.json();
     } catch {
-        return null;
-    }
-}
-
-async function ensureTable(env) {
-    await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS router_requests (
-      id TEXT PRIMARY KEY,
-      router_id TEXT NOT NULL,
-      status TEXT NOT NULL,
-      method TEXT NOT NULL,
-      url TEXT NOT NULL,
-      headers_json TEXT NOT NULL,
-      body_text TEXT,
-      response_status INTEGER,
-      response_body TEXT,
-      error_text TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `).run();
-
-    await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_router_requests_status
-    ON router_requests (router_id, status, created_at)
-  `).run();
-}
-
-export async function onRequestOptions() {
-    return new Response(null, {
-        status: 204,
-        headers: cors(),
-    });
-}
-
-export async function onRequest({ request, env }) {
-    await ensureTable(env);
-
-    const reqUrl = new URL(request.url);
-
-    if (request.method === "POST") {
-        const payload = await request.json().catch(() => null);
-
-        if (!payload || typeof payload !== "object") {
-            return json({ ok: false, error: "Invalid JSON body." }, 400);
-        }
-
-        const url = cleanUrl(payload.url || payload.dstUrl);
-        if (!url) {
-            return json({ ok: false, error: "Only valid https:// URLs are allowed." }, 400);
-        }
-
-        const id = makeId();
-        const now = new Date().toISOString();
-        const routerId = String(payload.routerId || "main").slice(0, 80);
-        const method = cleanMethod(payload.method);
-        const headers = payload.headers && typeof payload.headers === "object"
-            ? payload.headers
-            : {};
-        const body = payload.body == null
-            ? null
-            : typeof payload.body === "string"
-                ? payload.body
-                : JSON.stringify(payload.body);
-
-        await env.DB.prepare(`
-      INSERT INTO router_requests (
-        id, router_id, status, method, url, headers_json, body_text, created_at, updated_at
-      )
-      VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)
-    `)
-            .bind(
-                id,
-                routerId,
-                method,
-                url,
-                JSON.stringify(headers),
-                body,
-                now,
-                now
-            )
-            .run();
-
-        return json({
-            ok: true,
-            id,
-            status: "queued",
-            routerId,
-            method,
-            url,
-        });
+        return json(
+            { ok: false, error: "Invalid JSON" },
+            400,
+            corsHeaders
+        );
     }
 
-    if (request.method === "GET") {
-        const routerId = String(reqUrl.searchParams.get("routerId") || "main").slice(0, 80);
-        const limit = Math.min(Number(reqUrl.searchParams.get("limit") || 10), 50);
-        const claim = reqUrl.searchParams.get("claim") === "1";
+    const jobs = normalizeJobs(payload);
 
-        const { results } = await env.DB.prepare(`
-      SELECT *
-      FROM router_requests
-      WHERE router_id = ?
-        AND status = 'queued'
-      ORDER BY created_at ASC
-      LIMIT ?
-    `)
-            .bind(routerId, limit)
-            .all();
+    if (!jobs.length) {
+        return json(
+            {
+                ok: true,
+                accepted: 0,
+                dropped: 0,
+                reason: "empty",
+            },
+            202,
+            corsHeaders
+        );
+    }
 
-        const jobs = (results || []).map((row) => ({
-            id: row.id,
-            routerId: row.router_id,
-            status: claim ? "claimed" : row.status,
-            method: row.method,
-            url: row.url,
-            headers: JSON.parse(row.headers_json || "{}"),
-            body: row.body_text,
-            createdAt: row.created_at,
-        }));
+    const messages = jobs.slice(0, 25).map((job) => ({
+        routerId: payload.routerId || job.routerId || "main",
+        sessionId: payload.sessionId || job.sessionId || "",
+        pageUrl: payload.pageUrl || job.pageUrl || "",
+        createdFrom: payload.createdFrom || job.createdFrom || "browser-session",
+        capturedAt: job.capturedAt || payload.capturedAt || new Date().toISOString(),
 
-        if (claim && jobs.length) {
-            const now = new Date().toISOString();
+        url: job.url || "",
+        method: job.method || "GET",
+        headers: job.headers || {},
+        body: job.body || null,
+        meta: job.meta || {},
+    }));
 
-            for (const job of jobs) {
-                await env.DB.prepare(`
-          UPDATE router_requests
-          SET status = 'claimed', updated_at = ?
-          WHERE id = ?
-        `)
-                    .bind(now, job.id)
-                    .run();
+    try {
+        if (env.ROUTER_QUEUE && typeof env.ROUTER_QUEUE.sendBatch === "function") {
+            await env.ROUTER_QUEUE.sendBatch(
+                messages.map((body) => ({ body }))
+            );
+        } else if (env.ROUTER_QUEUE && typeof env.ROUTER_QUEUE.send === "function") {
+            await Promise.all(messages.map((message) => env.ROUTER_QUEUE.send(message)));
+        } else {
+            // No queue binding exists. Soft accept so browser does not fail.
+            return json(
+                {
+                    ok: true,
+                    accepted: 0,
+                    dropped: messages.length,
+                    reason: "queue_not_configured",
+                },
+                202,
+                corsHeaders
+            );
+        }
+
+        return json(
+            {
+                ok: true,
+                accepted: messages.length,
+                dropped: Math.max(0, jobs.length - messages.length),
+            },
+            202,
+            corsHeaders
+        );
+    } catch (error) {
+        if (isQueueFullError(error)) {
+            return json(
+                {
+                    ok: true,
+                    accepted: 0,
+                    dropped: messages.length,
+                    reason: "queue_full_soft_drop",
+                },
+                202,
+                {
+                    ...corsHeaders,
+                    "Retry-After": "10",
+                }
+            );
+        }
+
+        // Still return 202 so the browser app never sees this as a hard failure.
+        return json(
+            {
+                ok: true,
+                accepted: 0,
+                dropped: messages.length,
+                reason: "router_soft_drop",
+            },
+            202,
+            {
+                ...corsHeaders,
+                "Retry-After": "10",
             }
-        }
-
-        return json({
-            ok: true,
-            routerId,
-            count: jobs.length,
-            jobs,
-        });
+        );
     }
-
-    if (request.method === "PATCH") {
-        const payload = await request.json().catch(() => null);
-
-        if (!payload || !payload.id) {
-            return json({ ok: false, error: "Missing request id." }, 400);
-        }
-
-        const status = String(payload.status || "completed");
-        const allowed = ["completed", "failed", "queued"];
-        if (!allowed.includes(status)) {
-            return json({ ok: false, error: "Invalid status." }, 400);
-        }
-
-        await env.DB.prepare(`
-      UPDATE router_requests
-      SET status = ?,
-          response_status = ?,
-          response_body = ?,
-          error_text = ?,
-          updated_at = ?
-      WHERE id = ?
-    `)
-            .bind(
-                status,
-                payload.responseStatus || null,
-                payload.responseBody || null,
-                payload.error || null,
-                new Date().toISOString(),
-                payload.id
-            )
-            .run();
-
-        return json({
-            ok: true,
-            id: payload.id,
-            status,
-        });
-    }
-
-    return json({ ok: false, error: "Method not allowed." }, 405);
 }
