@@ -4,6 +4,8 @@ const ALLOWED_EXACT_HOSTS = new Set([
     "www.wordpress.com",
     "polymathprojects.org",
     "www.polymathprojects.org",
+    "traditionsofthesun.org",
+    "www.traditionsofthesun.org",
 ]);
 
 const ALLOWED_ORIGINS = new Set([
@@ -240,9 +242,19 @@ function getCacheTtl(url) {
     const path = url.pathname.toLowerCase();
 
     /*
-     * Feeds should refresh more frequently than individual REST resources.
+     * Music/news collections must refresh more frequently than individual
+     * WordPress resources. This includes WordPress.com Reader tag streams,
+     * standard post collections, and RSS/Atom feeds.
      */
+    const isReaderCollection = path.startsWith("/rest/v1.1/read/");
+    const isPostsCollection =
+        path.endsWith("/wp/v2/posts") ||
+        path.endsWith("/wp/v2/posts/") ||
+        /\/rest\/v1(?:\.1)?\/sites\/[^/]+\/posts\/?$/i.test(path);
+
     if (
+        isReaderCollection ||
+        isPostsCollection ||
         path.endsWith("/feed") ||
         path.endsWith("/feed/") ||
         isAllowedFeedQuery(url)
@@ -276,17 +288,17 @@ function copyForwardedRequestHeaders(request) {
      */
     headers.set(
         "User-Agent",
-        "AudioMasterLab-WordPressProxy/1.0"
+        "AudioMasterLab-WordPressProxy/2.0"
     );
 
     return headers;
 }
 
 async function fetchWithValidatedRedirects({
-    initialUrl,
-    method,
-    headers,
-}) {
+                                               initialUrl,
+                                               method,
+                                               headers,
+                                           }) {
     let currentUrl = new URL(initialUrl.toString());
 
     for (
@@ -387,11 +399,11 @@ class ProxyRequestError extends Error {
 }
 
 function buildResponseHeaders({
-    upstreamResponse,
-    corsHeaders,
-    finalUrl,
-    cacheTtl,
-}) {
+                                  upstreamResponse,
+                                  corsHeaders,
+                                  finalUrl,
+                                  cacheTtl,
+                              }) {
     const headers = new Headers(upstreamResponse.headers);
 
     /*
@@ -483,6 +495,10 @@ export async function onRequest(context) {
                         "/api/wordpressproxy?url=https%3A%2F%2Fterrytao.wordpress.com%2Fwp-json%2Fwp%2Fv2%2Fposts%3Fper_page%3D10",
                     feed:
                         "/api/wordpressproxy?url=https%3A%2F%2Fterrytao.wordpress.com%2Ffeed%2F",
+                    readerTag:
+                        "/api/wordpressproxy?url=https%3A%2F%2Fpublic-api.wordpress.com%2Frest%2Fv1.1%2Fread%2Ftags%2Fmusic-news%2Fposts%2F%3Fnumber%3D30",
+                    traditions:
+                        "/api/wordpressproxy?url=https%3A%2F%2Fwww.traditionsofthesun.org%2Fwp-json%2Fwp%2Fv2%2Fposts%3Fper_page%3D20%26orderby%3Ddate%26order%3Ddesc%26_embed%3D1",
                 },
             },
             400,
@@ -548,7 +564,7 @@ export async function onRequest(context) {
             {
                 status: upstreamResponse.status,
                 statusText:
-                    upstreamResponse.statusText,
+                upstreamResponse.statusText,
                 headers: responseHeaders,
             }
         );
@@ -575,4 +591,3 @@ export async function onRequest(context) {
         );
     }
 }
-
