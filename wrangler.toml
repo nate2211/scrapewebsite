@@ -15,3 +15,6 @@ database_id = "5b272eb4-5bea-49ea-abe1-dd55ec2a7aec"
 binding = "PYTHONROUTER"
 database_name = "pythonrouter"
 database_id = "108784d8-3081-4dc2-8266-3320555b984a"
+
+[secrets]
+required = ["YOUTUBE_API_KEY"]
