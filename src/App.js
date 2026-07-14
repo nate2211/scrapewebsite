@@ -5,6 +5,7 @@ import { CssBaseline, ThemeProvider, createTheme } from "@mui/material";
 import { Layout } from "./components/components";
 import Home from "./pages/Home";
 import Scrape from "./pages/Scrape";
+import Browser from "./pages/Browser";
 import { installRequestRecorder } from "./utils/requestRecorder";
 
 export default function App() {
@@ -101,6 +102,7 @@ export default function App() {
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/scrape" element={<Scrape />} />
+              <Route path="/browser" element={<Browser />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Layout>

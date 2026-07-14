@@ -62,6 +62,11 @@ export function Layout({ children }) {
             path: "/scrape",
             icon: <ManageSearchRounded fontSize="small" />,
         },
+        {
+            label: "Scrape Browser",
+            path: "/browser",
+            icon: <PublicRounded fontSize="small" />,
+        }
     ];
 
     return (
