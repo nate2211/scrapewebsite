@@ -4,12 +4,16 @@ import {
     validatePublicUrl,
 } from "../_shared/scrapeSecurity.js";
 
-function compactError(error, fallback = "Request failed.") {
+const MAX_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 22_000;
+const MAX_RESPONSE_BYTES = 4_000_000;
+const MAX_SELECTORS = 20;
+
+function compactError(error, fallback = "Browser render failed.") {
     if (!error) return fallback;
 
     if (typeof error === "string") {
-        const value = error.trim();
-        return (value || fallback).slice(0, 1_000);
+        return (error.trim() || fallback).slice(0, 1_000);
     }
 
     const message =
@@ -20,14 +24,10 @@ function compactError(error, fallback = "Request failed.") {
     return message.slice(0, 1_000);
 }
 
-const MAX_TIMEOUT_MS = 30_000;
-const DEFAULT_TIMEOUT_MS = 22_000;
-const MAX_BODY_BYTES = 2_000_000;
-
 function clamp(value, min, max, fallback) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return fallback;
-    return Math.min(Math.max(number, min), max);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
 }
 
 function boolValue(value, fallback = false) {
@@ -37,28 +37,28 @@ function boolValue(value, fallback = false) {
     return fallback;
 }
 
-function cleanWorkerUrl(rawUrl) {
-    const parsed = validatePublicUrl(rawUrl);
-    parsed.hash = "";
-    return parsed.toString();
-}
-
 function timeoutSignal(timeoutMs) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort("Browser render timed out."), timeoutMs);
+    const timer = setTimeout(
+        () => controller.abort("Cloudflare Browser Run REST request timed out."),
+        timeoutMs
+    );
+
     return {
         signal: controller.signal,
-        clear: () => clearTimeout(timer),
+        clear() {
+            clearTimeout(timer);
+        },
     };
 }
 
-async function readLimitedText(response, limit = MAX_BODY_BYTES) {
+async function readLimitedText(response, limit = MAX_RESPONSE_BYTES) {
     if (!response.body) return "";
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let text = "";
-    let bytes = 0;
+    let total = 0;
 
     try {
         while (true) {
@@ -66,20 +66,24 @@ async function readLimitedText(response, limit = MAX_BODY_BYTES) {
             if (done) break;
             if (!value) continue;
 
-            const remaining = limit - bytes;
+            const remaining = limit - total;
             if (remaining <= 0) break;
 
-            const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
-            bytes += chunk.byteLength;
+            const chunk =
+                value.byteLength > remaining
+                    ? value.slice(0, remaining)
+                    : value;
+
+            total += chunk.byteLength;
             text += decoder.decode(chunk, { stream: true });
 
-            if (value.byteLength > remaining || bytes >= limit) break;
+            if (value.byteLength > remaining || total >= limit) break;
         }
     } finally {
         try {
             await reader.cancel();
         } catch {
-            // Ignore cleanup errors.
+            // Ignore stream cleanup errors.
         }
     }
 
@@ -87,98 +91,62 @@ async function readLimitedText(response, limit = MAX_BODY_BYTES) {
     return text;
 }
 
-function normalizeRenderedPayload(payload, sourceUrl) {
-    if (!payload || typeof payload !== "object") return null;
+function requireCloudflareConfiguration(context) {
+    const accountId = String(
+        context.env.CLOUDFLARE_ACCOUNT_ID || ""
+    ).trim();
 
-    const rendered = payload.rendered || payload.data || payload.result || payload;
-    if (!rendered || typeof rendered !== "object") return null;
+    const token = String(
+        context.env.CLOUDFLARE_BROWSER_TOKEN ||
+        context.env.CLOUDFLARE_API_TOKEN ||
+        ""
+    ).trim();
 
-    return {
-        ...rendered,
-        url: rendered.url || rendered.finalUrl || sourceUrl,
-        finalUrl: rendered.finalUrl || rendered.url || sourceUrl,
-        source: rendered.source || payload.provider || "browser-render",
-        challengeDetected: Boolean(
-            rendered.challengeDetected ||
-            rendered.challenge?.detected ||
-            payload.challengeDetected
-        ),
-    };
-}
-
-async function forwardToBrowserWorker(context, body, sourceUrl, timeoutMs) {
-    const workerUrl = cleanWorkerUrl(context.env.BROWSER_WORKER_URL);
-    const timeout = timeoutSignal(timeoutMs + 2_000);
-
-    try {
-        const response = await fetch(workerUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Accept: "application/json",
-                ...(context.env.BROWSER_WORKER_TOKEN
-                    ? { Authorization: `Bearer ${context.env.BROWSER_WORKER_TOKEN}` }
-                    : {}),
-            },
-            body: JSON.stringify({
-                ...body,
-                url: sourceUrl,
-                timeoutMs,
-            }),
-            signal: timeout.signal,
-        });
-
-        const text = await readLimitedText(response);
-        let payload;
-
-        try {
-            payload = text ? JSON.parse(text) : {};
-        } catch {
-            throw new Error(`Browser worker returned non-JSON content (HTTP ${response.status}).`);
-        }
-
-        if (!response.ok || payload?.ok === false) {
-            throw new Error(payload?.error || `Browser worker returned HTTP ${response.status}.`);
-        }
-
-        const rendered = normalizeRenderedPayload(payload, sourceUrl);
-        if (!rendered) throw new Error("Browser worker response did not contain rendered page data.");
-
-        return json({
-            ok: true,
-            provider: payload.provider || "cloudflare-browser-run-worker",
-            rendered,
-            warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
-            timestamp: new Date().toISOString(),
-        });
-    } finally {
-        timeout.clear();
+    if (!accountId) {
+        throw new Error(
+            "CLOUDFLARE_ACCOUNT_ID is not configured in the Pages project."
+        );
     }
+
+    if (!token) {
+        throw new Error(
+            "CLOUDFLARE_BROWSER_TOKEN is not configured in the Pages project."
+        );
+    }
+
+    return { accountId, token };
 }
 
-function cloudflareApiHeaders(context) {
-    if (!context.env.CLOUDFLARE_BROWSER_TOKEN) return {};
-    return {
-        Authorization: `Bearer ${context.env.CLOUDFLARE_BROWSER_TOKEN}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-    };
-}
+async function callQuickAction(
+    context,
+    action,
+    requestBody,
+    timeoutMs
+) {
+    const { accountId, token } =
+        requireCloudflareConfiguration(context);
 
-async function callBrowserRenderingApi(context, action, requestBody, timeoutMs) {
-    const accountId = String(context.env.CLOUDFLARE_ACCOUNT_ID || "").trim();
-    if (!accountId) throw new Error("CLOUDFLARE_ACCOUNT_ID is not configured.");
+    const endpoint =
+        `https://api.cloudflare.com/client/v4/accounts/` +
+        `${encodeURIComponent(accountId)}/browser-rendering/` +
+        `${encodeURIComponent(action)}`;
 
-    const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering/${action}`;
     const timeout = timeoutSignal(timeoutMs);
 
     try {
-        const response = await fetch(url, {
+        const response = await fetch(endpoint, {
             method: "POST",
-            headers: cloudflareApiHeaders(context),
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+                Accept: "application/json",
+            },
             body: JSON.stringify(requestBody),
             signal: timeout.signal,
         });
+
+        const browserMsUsed =
+            response.headers.get("X-Browser-Ms-Used") || "";
 
         const text = await readLimitedText(response);
         let payload = null;
@@ -190,101 +158,360 @@ async function callBrowserRenderingApi(context, action, requestBody, timeoutMs) 
         }
 
         if (!response.ok) {
-            const message = payload?.errors?.[0]?.message || payload?.error || text.slice(0, 500);
-            throw new Error(`${action} returned HTTP ${response.status}${message ? `: ${message}` : ""}`);
+            const message =
+                payload?.errors?.[0]?.message ||
+                payload?.error ||
+                text.slice(0, 800) ||
+                `HTTP ${response.status}`;
+
+            throw new Error(
+                `Cloudflare Browser Run ${action} failed: ${message}`
+            );
         }
 
-        if (payload && payload.success === false) {
-            throw new Error(payload?.errors?.[0]?.message || `${action} failed.`);
+        if (payload?.success === false) {
+            throw new Error(
+                payload?.errors?.[0]?.message ||
+                `Cloudflare Browser Run ${action} failed.`
+            );
         }
 
-        return payload?.result ?? payload ?? text;
+        return {
+            result: payload?.result ?? payload ?? text,
+            meta: payload?.meta || {},
+            browserMsUsed,
+        };
     } finally {
         timeout.clear();
     }
 }
 
-function browserApiHtml(result) {
-    if (typeof result === "string") return result;
-    if (!result || typeof result !== "object") return "";
-    return String(result.content || result.html || result.body || result.result || "");
-}
+const DEEP_DISCOVERY_SCRIPT = String.raw`
+(() => {
+  const LIMIT = 800;
+  const urls = new Set();
+  const apiUrls = new Set();
+  const imageUrls = new Set();
+  const mediaUrls = new Set();
+  const shadowLinks = new Set();
+  const reactLinks = new Set();
+  const performanceResources = [];
+  let shadowRootCount = 0;
+  let visitedElements = 0;
 
-function browserApiLinks(result) {
-    const source = Array.isArray(result)
-        ? result
-        : Array.isArray(result?.links)
-            ? result.links
-            : Array.isArray(result?.result)
-                ? result.result
-                : [];
+  const addUrl = (value, bucket = urls) => {
+    if (!value || bucket.size >= LIMIT) return;
 
-    return source
-        .map((item) => typeof item === "string" ? item : item?.href || item?.url)
-        .filter(Boolean)
-        .slice(0, 500);
-}
+    const source = String(value).trim();
+    if (!source || source.length > 4000) return;
+    if (/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(source)) return;
 
-function detectChallenge(html) {
-    const source = String(html || "").slice(0, 500_000);
-    const patterns = [
-        /cf-chl-/i,
-        /challenges\.cloudflare\.com/i,
-        /g-recaptcha|recaptcha\/api/i,
-        /hcaptcha|h-captcha/i,
-        /challenges\.cloudflare\.com\/turnstile|cf-turnstile/i,
-        /verify (?:you are|that you are) human/i,
-        /security check|checking your browser|attention required/i,
+    try {
+      const absolute = new URL(source, location.href).href;
+      if (/^https?:/i.test(absolute)) bucket.add(absolute);
+    } catch {
+      // Ignore invalid URLs.
+    }
+  };
+
+  const inspectString = (value, preferredBucket = urls) => {
+    if (typeof value !== "string" || value.length > 10000) return;
+
+    const matches = value.match(/https?:\/\/[^\s"'<>\\)]+/g) || [];
+    for (const match of matches.slice(0, 40)) {
+      addUrl(match, preferredBucket);
+    }
+  };
+
+  const inspectReactValue = (value, depth = 0, seen = new WeakSet()) => {
+    if (depth > 4 || reactLinks.size >= LIMIT) return;
+
+    if (typeof value === "string") {
+      inspectString(value, reactLinks);
+      if (/^(\/|\.\/|\.\.\/)[^\s]+/.test(value)) {
+        addUrl(value, reactLinks);
+      }
+      return;
+    }
+
+    if (!value || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    const entries = Array.isArray(value)
+      ? value.slice(0, 30).map((item, index) => [index, item])
+      : Object.entries(value).slice(0, 40);
+
+    for (const [, child] of entries) {
+      inspectReactValue(child, depth + 1, seen);
+      if (reactLinks.size >= LIMIT) break;
+    }
+  };
+
+  const inspectElement = (element, insideShadow = false) => {
+    if (!(element instanceof Element) || visitedElements >= 6000) return;
+    visitedElements += 1;
+
+    const attributes = [
+      "href",
+      "src",
+      "poster",
+      "action",
+      "data-src",
+      "data-url",
+      "data-href",
+      "data-image",
+      "data-video",
+      "data-audio",
+      "content",
     ];
-    return patterns.some((pattern) => pattern.test(source));
+
+    for (const name of attributes) {
+      const value = element.getAttribute(name);
+      if (!value) continue;
+
+      addUrl(value);
+      if (insideShadow) addUrl(value, shadowLinks);
+
+      const tag = element.tagName.toLowerCase();
+      if (tag === "img" || /image|thumbnail|poster/i.test(name)) {
+        addUrl(value, imageUrls);
+      }
+      if (
+        ["video", "audio", "source", "track"].includes(tag) ||
+        /video|audio|media/i.test(name)
+      ) {
+        addUrl(value, mediaUrls);
+      }
+    }
+
+    const srcset = element.getAttribute("srcset");
+    if (srcset) {
+      for (const candidate of srcset.split(",")) {
+        addUrl(candidate.trim().split(/\s+/)[0], imageUrls);
+      }
+    }
+
+    try {
+      const background = getComputedStyle(element).backgroundImage || "";
+      const matches = [...background.matchAll(/url\((['"]?)(.*?)\1\)/g)];
+      for (const match of matches.slice(0, 10)) {
+        addUrl(match[2], imageUrls);
+      }
+    } catch {
+      // Ignore inaccessible computed styles.
+    }
+
+    const ownKeys = Object.keys(element);
+    for (const key of ownKeys) {
+      if (
+        key.startsWith("__reactProps$") ||
+        key.startsWith("__reactFiber$") ||
+        key.startsWith("__reactContainer$")
+      ) {
+        try {
+          inspectReactValue(element[key]);
+        } catch {
+          // Ignore inaccessible framework internals.
+        }
+      }
+    }
+  };
+
+  const walkRoot = (root, insideShadow = false, depth = 0) => {
+    if (!root || depth > 8 || visitedElements >= 6000) return;
+
+    const elements = root.querySelectorAll
+      ? root.querySelectorAll("*")
+      : [];
+
+    for (const element of elements) {
+      inspectElement(element, insideShadow);
+
+      if (element.shadowRoot) {
+        shadowRootCount += 1;
+        walkRoot(element.shadowRoot, true, depth + 1);
+      }
+
+      if (visitedElements >= 6000) break;
+    }
+  };
+
+  walkRoot(document, false, 0);
+
+  try {
+    const resources = performance.getEntriesByType("resource").slice(-1200);
+
+    for (const entry of resources) {
+      if (!entry?.name) continue;
+
+      addUrl(entry.name);
+
+      const record = {
+        url: entry.name,
+        initiatorType: entry.initiatorType || "",
+        duration: Math.round(Number(entry.duration || 0)),
+        transferSize: Number(entry.transferSize || 0),
+        encodedBodySize: Number(entry.encodedBodySize || 0),
+        decodedBodySize: Number(entry.decodedBodySize || 0),
+      };
+
+      performanceResources.push(record);
+
+      if (
+        ["fetch", "xmlhttprequest", "beacon"].includes(
+          String(entry.initiatorType || "").toLowerCase()
+        ) ||
+        /\/api\/|graphql|\.json(?:$|\?)/i.test(entry.name)
+      ) {
+        addUrl(entry.name, apiUrls);
+      }
+
+      if (
+        /\.(?:png|jpe?g|gif|webp|avif|svg)(?:$|\?)/i.test(entry.name)
+      ) {
+        addUrl(entry.name, imageUrls);
+      }
+
+      if (
+        /\.(?:mp3|wav|ogg|m4a|aac|flac|mp4|webm|mov|m3u8|mpd)(?:$|\?)/i.test(
+          entry.name
+        )
+      ) {
+        addUrl(entry.name, mediaUrls);
+      }
+    }
+  } catch {
+    // Ignore unavailable performance entries.
+  }
+
+  for (const url of urls) {
+    if (/\/api\/|graphql|\.json(?:$|\?)/i.test(url)) {
+      apiUrls.add(url);
+    }
+    if (/\.(?:png|jpe?g|gif|webp|avif|svg)(?:$|\?)/i.test(url)) {
+      imageUrls.add(url);
+    }
+    if (/\.(?:mp3|wav|ogg|m4a|aac|flac|mp4|webm|mov|m3u8|mpd)(?:$|\?)/i.test(url)) {
+      mediaUrls.add(url);
+    }
+  }
+
+  const html = document.documentElement?.outerHTML || "";
+  const challengeDetected = [
+    /cf-chl-/i,
+    /challenges\.cloudflare\.com/i,
+    /g-recaptcha|recaptcha\/api/i,
+    /hcaptcha|h-captcha/i,
+    /cf-turnstile/i,
+    /verify (?:you are|that you are) human/i,
+    /checking your browser|attention required/i,
+  ].some((pattern) => pattern.test(html.slice(0, 500000)));
+
+  const payload = {
+    finalUrl: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    shadowRootCount,
+    visitedElements,
+    challengeDetected,
+    urls: [...urls].slice(0, LIMIT),
+    apiUrls: [...apiUrls].slice(0, LIMIT),
+    imageUrls: [...imageUrls].slice(0, LIMIT),
+    mediaUrls: [...mediaUrls].slice(0, LIMIT),
+    shadowLinks: [...shadowLinks].slice(0, LIMIT),
+    reactLinks: [...reactLinks].slice(0, LIMIT),
+    performanceResources: performanceResources.slice(0, LIMIT),
+  };
+
+  try {
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+
+    let marker = document.getElementById(
+      "__scrapewebsite_browser_data__"
+    );
+
+    if (!marker) {
+      marker = document.createElement("script");
+      marker.id = "__scrapewebsite_browser_data__";
+      marker.type = "application/octet-stream";
+      (document.head || document.documentElement).appendChild(marker);
+    }
+
+    marker.textContent = btoa(binary);
+  } catch {
+    // The normal rendered HTML is still useful if the marker cannot be added.
+  }
+})();
+`;
+
+function decodeUtf8Base64(value) {
+    if (!value) return "";
+
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+    }
+
+    return new TextDecoder().decode(bytes);
 }
 
-async function useCloudflareQuickActions(context, body, sourceUrl, timeoutMs) {
-    const requestBody = {
-        url: sourceUrl,
-        gotoOptions: {
-            waitUntil: body.waitUntil || "networkidle2",
-            timeout: timeoutMs,
-        },
-    };
+function extractDeepDiscovery(html) {
+    const source = String(html || "");
+    const pattern =
+        /<script[^>]+id=["']__scrapewebsite_browser_data__["'][^>]*>([\s\S]*?)<\/script>/i;
 
-    const [contentResult, linksResult] = await Promise.all([
-        callBrowserRenderingApi(context, "content", requestBody, timeoutMs),
-        callBrowserRenderingApi(context, "links", requestBody, timeoutMs).catch(() => []),
-    ]);
+    const match = source.match(pattern);
+    if (!match?.[1]) return null;
 
-    const html = browserApiHtml(contentResult);
-    const links = browserApiLinks(linksResult);
-    const pageData = extractPageData({
-        html,
-        url: sourceUrl,
-        query: String(body.instruction || body.query || ""),
-        mode: String(body.mode || "research"),
-        status: 200,
-        contentType: "text/html; charset=utf-8",
-        truncated: html.length >= MAX_BODY_BYTES,
-    });
+    try {
+        return JSON.parse(
+            decodeUtf8Base64(match[1].trim())
+        );
+    } catch {
+        return null;
+    }
+}
 
-    return json({
-        ok: true,
-        provider: "cloudflare-browser-rendering-rest",
-        rendered: {
-            ...pageData,
-            html,
-            links: links.length ? links : pageData.links,
-            finalUrl: pageData.url,
-            source: "cloudflare-browser-rendering-rest",
-            challengeDetected: detectChallenge(html),
-            network: [],
-            shadowLinks: [],
-            reactLinks: [],
-            apiProbes: [],
-        },
-        warnings: [
-            "The REST quick-action fallback returns rendered HTML and links, but detailed response bodies, open shadow roots, React-owned URLs, and page-session API probes require the companion Browser Run worker.",
-        ],
-        timestamp: new Date().toISOString(),
-    });
+function normalizeLinks(value) {
+    const source = Array.isArray(value)
+        ? value
+        : Array.isArray(value?.links)
+            ? value.links
+            : [];
+
+    const output = [];
+    const seen = new Set();
+
+    for (const item of source) {
+        const url =
+            typeof item === "string"
+                ? item
+                : item?.href || item?.url || "";
+
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        output.push(url);
+
+        if (output.length >= 1_000) break;
+    }
+
+    return output;
+}
+
+function normalizeSelectors(value) {
+    if (!Array.isArray(value)) return [];
+
+    return value
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, MAX_SELECTORS);
 }
 
 export async function onRequestOptions() {
@@ -295,20 +522,33 @@ export async function onRequestGet(context) {
     return json({
         ok: true,
         route: "/api/browser-render",
-        configured: {
-            browserWorker: Boolean(context.env.BROWSER_WORKER_URL),
-            cloudflareRest: Boolean(
-                context.env.CLOUDFLARE_ACCOUNT_ID &&
-                context.env.CLOUDFLARE_BROWSER_TOKEN
-            ),
-        },
+        provider: "cloudflare-browser-run-rest",
+        configured: Boolean(
+            context.env.CLOUDFLARE_ACCOUNT_ID &&
+            (
+                context.env.CLOUDFLARE_BROWSER_TOKEN ||
+                context.env.CLOUDFLARE_API_TOKEN
+            )
+        ),
+        requiredSecrets: [
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_BROWSER_TOKEN",
+        ],
         capabilities: {
+            javascriptRendering: true,
+            cssRendering: true,
             renderedHtml: true,
-            screenshot: Boolean(context.env.BROWSER_WORKER_URL),
-            networkCapture: Boolean(context.env.BROWSER_WORKER_URL),
-            shadowDom: Boolean(context.env.BROWSER_WORKER_URL),
-            reactDiscovery: Boolean(context.env.BROWSER_WORKER_URL),
-            safeSameOriginApiProbes: Boolean(context.env.BROWSER_WORKER_URL),
+            screenshot: true,
+            markdown: true,
+            accessibilityTree: true,
+            links: true,
+            cssSelectorScrape: true,
+            openShadowDomDiscovery: true,
+            reactUrlDiscovery: true,
+            performanceResourceDiscovery: true,
+            fullNetworkInterception: false,
+            responseBodyCapture: false,
+            persistentBrowserSession: false,
             captchaBypass: false,
         },
         timestamp: new Date().toISOString(),
@@ -320,62 +560,261 @@ export async function onRequestPost(context) {
 
     try {
         const body = await context.request.json();
-        const sourceUrl = validatePublicUrl(body.url || body.sourceUrl).toString();
-        const timeoutMs = clamp(body.timeoutMs, 5_000, MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        const sourceUrl = validatePublicUrl(
+            body.url || body.sourceUrl
+        ).toString();
 
-        const normalizedBody = {
-            instruction: String(body.instruction || body.query || "").slice(0, 4_000),
-            mode: String(body.mode || "research").slice(0, 32),
-            waitUntil: String(body.waitUntil || "networkidle2").slice(0, 40),
-            timeoutMs,
-            settleMs: clamp(body.settleMs, 0, 5_000, 800),
-            includeScreenshot: boolValue(body.includeScreenshot, true),
-            captureResponseBodies: boolValue(body.captureResponseBodies, true),
-            includeShadowDom: boolValue(body.includeShadowDom, true),
-            includeReactLinks: boolValue(body.includeReactLinks, true),
-            probeApis: boolValue(body.probeApis, false),
-            maxProbes: clamp(body.maxProbes, 0, 12, 8),
-        };
+        const timeoutMs = clamp(
+            body.timeoutMs,
+            5_000,
+            MAX_TIMEOUT_MS,
+            DEFAULT_TIMEOUT_MS
+        );
 
-        let response;
-        if (context.env.BROWSER_WORKER_URL) {
-            response = await forwardToBrowserWorker(
-                context,
-                normalizedBody,
-                sourceUrl,
-                timeoutMs
-            );
-        } else if (
-            context.env.CLOUDFLARE_ACCOUNT_ID &&
-            context.env.CLOUDFLARE_BROWSER_TOKEN
-        ) {
-            response = await useCloudflareQuickActions(
-                context,
-                normalizedBody,
-                sourceUrl,
-                timeoutMs
-            );
-        } else {
-            return json({
-                ok: false,
-                error: "Browser rendering is not configured. Deploy the included Browser Run worker and set BROWSER_WORKER_URL, or set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_BROWSER_TOKEN for the limited REST fallback.",
-                setupRequired: true,
-            }, 501);
+        const waitUntil = [
+            "load",
+            "domcontentloaded",
+            "networkidle0",
+            "networkidle2",
+        ].includes(body.waitUntil)
+            ? body.waitUntil
+            : "networkidle2";
+
+        const includeScreenshot = boolValue(
+            body.includeScreenshot,
+            true
+        );
+
+        const includeMarkdown = boolValue(
+            body.includeMarkdown,
+            false
+        );
+
+        const includeAccessibilityTree = boolValue(
+            body.includeAccessibilityTree,
+            false
+        );
+
+        const viewportWidth = clamp(
+            body.viewport?.width,
+            320,
+            2_560,
+            1_440
+        );
+
+        const viewportHeight = clamp(
+            body.viewport?.height,
+            240,
+            2_000,
+            1_000
+        );
+
+        const formats = ["content"];
+
+        if (includeScreenshot) formats.push("screenshot");
+        if (includeMarkdown) formats.push("markdown");
+        if (includeAccessibilityTree) {
+            formats.push("accessibilityTree");
         }
 
-        const headers = new Headers(response.headers);
-        headers.set("X-ScrapeWebsite-Elapsed-Ms", String(Date.now() - startedAt));
-        return new Response(response.body, {
-            status: response.status,
-            headers,
+        // Cloudflare snapshot requires at least two formats.
+        if (formats.length < 2) formats.push("screenshot");
+
+        const commonRequest = {
+            url: sourceUrl,
+            gotoOptions: {
+                waitUntil,
+                timeout: timeoutMs,
+            },
+            viewport: {
+                width: viewportWidth,
+                height: viewportHeight,
+                deviceScaleFactor: clamp(
+                    body.viewport?.deviceScaleFactor,
+                    1,
+                    3,
+                    1
+                ),
+            },
+            userAgent:
+                typeof body.userAgent === "string"
+                    ? body.userAgent.slice(0, 500)
+                    : undefined,
+        };
+
+        const snapshotRequest = {
+            ...commonRequest,
+            formats,
+            screenshotOptions: {
+                fullPage: boolValue(
+                    body.fullPageScreenshot,
+                    true
+                ),
+            },
+            addScriptTag: [
+                {
+                    content: DEEP_DISCOVERY_SCRIPT,
+                },
+            ],
+        };
+
+        const linksRequest = {
+            ...commonRequest,
+            visibleLinksOnly: boolValue(
+                body.visibleLinksOnly,
+                false
+            ),
+            excludeExternalLinks: boolValue(
+                body.excludeExternalLinks,
+                false
+            ),
+        };
+
+        const selectors = normalizeSelectors(body.selectors);
+
+        const jobs = [
+            callQuickAction(
+                context,
+                "snapshot",
+                snapshotRequest,
+                timeoutMs + 3_000
+            ),
+            callQuickAction(
+                context,
+                "links",
+                linksRequest,
+                timeoutMs + 3_000
+            ).catch((error) => ({
+                result: [],
+                meta: {},
+                browserMsUsed: "",
+                warning: compactError(error),
+            })),
+        ];
+
+        if (selectors.length) {
+            jobs.push(
+                callQuickAction(
+                    context,
+                    "scrape",
+                    {
+                        ...commonRequest,
+                        elements: selectors.map((selector) => ({
+                            selector,
+                        })),
+                    },
+                    timeoutMs + 3_000
+                ).catch((error) => ({
+                    result: [],
+                    meta: {},
+                    browserMsUsed: "",
+                    warning: compactError(error),
+                }))
+            );
+        }
+
+        const [snapshotResponse, linksResponse, scrapeResponse] =
+            await Promise.all(jobs);
+
+        const snapshot = snapshotResponse.result || {};
+        const html = String(
+            snapshot.content ||
+            snapshot.html ||
+            ""
+        );
+
+        const deep = extractDeepDiscovery(html) || {};
+        const links = normalizeLinks(linksResponse.result);
+
+        const pageData = extractPageData({
+            html,
+            url: deep.finalUrl || sourceUrl,
+            query: String(
+                body.instruction || body.query || ""
+            ).slice(0, 4_000),
+            mode: String(body.mode || "research").slice(0, 40),
+            status: Number(
+                snapshotResponse.meta?.status || 200
+            ),
+            contentType: "text/html; charset=utf-8",
+            truncated: html.length >= MAX_RESPONSE_BYTES,
         });
-    } catch (error) {
-        const status = error?.name === "AbortError" ? 504 : 400;
+
+        const warnings = [
+            linksResponse.warning,
+            scrapeResponse?.warning,
+        ].filter(Boolean);
+
+        warnings.push(
+            "Cloudflare REST Quick Actions render JavaScript and CSS, but do not expose complete request/response interception or persistent browser sessions. Use Browser Run sessions, CDP, Playwright, or Puppeteer when those capabilities are required."
+        );
+
         return json({
-            ok: false,
-            error: compactError(error, "Browser render failed."),
+            ok: true,
+            provider: "cloudflare-browser-run-rest",
+            rendered: {
+                ...pageData,
+                url: deep.finalUrl || pageData.url || sourceUrl,
+                finalUrl:
+                    deep.finalUrl || pageData.url || sourceUrl,
+                title:
+                    deep.title ||
+                    snapshotResponse.meta?.title ||
+                    pageData.title ||
+                    "",
+                html,
+                screenshot: snapshot.screenshot || "",
+                screenshotDataUrl: snapshot.screenshot
+                    ? `data:image/png;base64,${snapshot.screenshot}`
+                    : "",
+                markdown: snapshot.markdown || "",
+                accessibilityTree:
+                    snapshot.accessibilityTree || null,
+                links:
+                    links.length
+                        ? links
+                        : deep.urls || pageData.links || [],
+                shadowLinks: deep.shadowLinks || [],
+                reactLinks: deep.reactLinks || [],
+                apiUrls: deep.apiUrls || [],
+                imageUrls: deep.imageUrls || [],
+                mediaUrls: deep.mediaUrls || [],
+                network:
+                    deep.performanceResources || [],
+                shadowRootCount:
+                    Number(deep.shadowRootCount || 0),
+                challengeDetected: Boolean(
+                    deep.challengeDetected
+                ),
+                selectorResults:
+                    scrapeResponse?.result || [],
+                apiProbes: [],
+                source: "cloudflare-browser-run-rest",
+            },
+            usage: {
+                snapshotBrowserMs:
+                    snapshotResponse.browserMsUsed || "",
+                linksBrowserMs:
+                    linksResponse.browserMsUsed || "",
+                scrapeBrowserMs:
+                    scrapeResponse?.browserMsUsed || "",
+            },
+            warnings,
             elapsedMs: Date.now() - startedAt,
             timestamp: new Date().toISOString(),
-        }, status);
+        });
+    } catch (error) {
+        const status =
+            error?.name === "AbortError" ? 504 : 400;
+
+        return json(
+            {
+                ok: false,
+                error: compactError(error),
+                elapsedMs: Date.now() - startedAt,
+                timestamp: new Date().toISOString(),
+            },
+            status
+        );
     }
 }
