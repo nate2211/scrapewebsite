@@ -1,9 +1,24 @@
 import {
-    compactError,
     extractPageData,
     json,
     validatePublicUrl,
 } from "../_shared/scrapeSecurity.js";
+
+function compactError(error, fallback = "Request failed.") {
+    if (!error) return fallback;
+
+    if (typeof error === "string") {
+        const value = error.trim();
+        return (value || fallback).slice(0, 1_000);
+    }
+
+    const message =
+        typeof error.message === "string" && error.message.trim()
+            ? error.message.trim()
+            : fallback;
+
+    return message.slice(0, 1_000);
+}
 
 const MAX_TIMEOUT_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 22_000;
