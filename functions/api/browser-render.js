@@ -117,11 +117,16 @@ function requireCloudflareConfiguration(context) {
     return { accountId, token };
 }
 
+function sleep(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 async function callQuickAction(
     context,
     action,
     requestBody,
-    timeoutMs
+    timeoutMs,
+    maxRateLimitRetries = 1
 ) {
     const { accountId, token } =
         requireCloudflareConfiguration(context);
@@ -131,39 +136,84 @@ async function callQuickAction(
         `${encodeURIComponent(accountId)}/browser-rendering/` +
         `${encodeURIComponent(action)}`;
 
-    const timeout = timeoutSignal(timeoutMs);
+    for (
+        let attempt = 0;
+        attempt <= maxRateLimitRetries;
+        attempt += 1
+    ) {
+        const timeout = timeoutSignal(timeoutMs);
 
-    try {
-        const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-                Accept: "application/json",
-            },
-            body: JSON.stringify(requestBody),
-            signal: timeout.signal,
-        });
-
-        const browserMsUsed =
-            response.headers.get("X-Browser-Ms-Used") || "";
-
-        const text = await readLimitedText(response);
+        let response;
+        let text = "";
         let payload = null;
+        let browserMsUsed = "";
 
         try {
-            payload = text ? JSON.parse(text) : null;
-        } catch {
-            payload = null;
+            response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+                body: JSON.stringify(requestBody),
+                signal: timeout.signal,
+            });
+
+            browserMsUsed =
+                response.headers.get("X-Browser-Ms-Used") || "";
+
+            text = await readLimitedText(response);
+
+            try {
+                payload = text ? JSON.parse(text) : null;
+            } catch {
+                payload = null;
+            }
+        } finally {
+            timeout.clear();
         }
 
-        if (!response.ok) {
-            const message =
-                payload?.errors?.[0]?.message ||
-                payload?.error ||
-                text.slice(0, 800) ||
-                `HTTP ${response.status}`;
+        const message =
+            payload?.errors?.[0]?.message ||
+            payload?.error ||
+            text.slice(0, 800) ||
+            `HTTP ${response?.status || 500}`;
 
+        if (response?.status === 429) {
+            if (/browser time limit exceeded|for today/i.test(message)) {
+                throw new Error(
+                    "Cloudflare Browser Run daily browser-time limit was exceeded. " +
+                    "Workers Free accounts receive 10 browser minutes per UTC day."
+                );
+            }
+
+            const retryAfterHeader =
+                response.headers.get("Retry-After") || "";
+
+            const parsedRetryAfter =
+                Number.parseFloat(retryAfterHeader);
+
+            const retryAfterSeconds =
+                Number.isFinite(parsedRetryAfter) &&
+                parsedRetryAfter > 0
+                    ? Math.min(30, Math.max(1, parsedRetryAfter))
+                    : 11;
+
+            if (attempt < maxRateLimitRetries) {
+                await sleep(
+                    Math.ceil(retryAfterSeconds * 1_000) + 250
+                );
+                continue;
+            }
+
+            throw new Error(
+                `Cloudflare Browser Run ${action} rate limited the request. ` +
+                `Retry after approximately ${retryAfterSeconds} seconds.`
+            );
+        }
+
+        if (!response?.ok) {
             throw new Error(
                 `Cloudflare Browser Run ${action} failed: ${message}`
             );
@@ -181,9 +231,11 @@ async function callQuickAction(
             meta: payload?.meta || {},
             browserMsUsed,
         };
-    } finally {
-        timeout.clear();
     }
+
+    throw new Error(
+        `Cloudflare Browser Run ${action} did not complete.`
+    );
 }
 
 const DEEP_DISCOVERY_SCRIPT = String.raw`
@@ -658,63 +710,20 @@ export async function onRequestPost(context) {
             ],
         };
 
-        const linksRequest = {
-            ...commonRequest,
-            visibleLinksOnly: boolValue(
-                body.visibleLinksOnly,
-                false
-            ),
-            excludeExternalLinks: boolValue(
-                body.excludeExternalLinks,
-                false
-            ),
-        };
-
         const selectors = normalizeSelectors(body.selectors);
 
-        const jobs = [
-            callQuickAction(
-                context,
-                "snapshot",
-                snapshotRequest,
-                timeoutMs + 3_000
-            ),
-            callQuickAction(
-                context,
-                "links",
-                linksRequest,
-                timeoutMs + 3_000
-            ).catch((error) => ({
-                result: [],
-                meta: {},
-                browserMsUsed: "",
-                warning: compactError(error),
-            })),
-        ];
-
-        if (selectors.length) {
-            jobs.push(
-                callQuickAction(
-                    context,
-                    "scrape",
-                    {
-                        ...commonRequest,
-                        elements: selectors.map((selector) => ({
-                            selector,
-                        })),
-                    },
-                    timeoutMs + 3_000
-                ).catch((error) => ({
-                    result: [],
-                    meta: {},
-                    browserMsUsed: "",
-                    warning: compactError(error),
-                }))
-            );
-        }
-
-        const [snapshotResponse, linksResponse, scrapeResponse] =
-            await Promise.all(jobs);
+        // One Quick Action per route invocation keeps this compatible with
+        // the Workers Free limit of one Quick Action every ten seconds.
+        // The injected script performs links, API, media, image, React,
+        // open-shadow-root, and performance-resource discovery inside the
+        // single snapshot operation.
+        const snapshotResponse = await callQuickAction(
+            context,
+            "snapshot",
+            snapshotRequest,
+            timeoutMs + 3_000,
+            1
+        );
 
         const snapshot = snapshotResponse.result || {};
         const html = String(
@@ -724,7 +733,6 @@ export async function onRequestPost(context) {
         );
 
         const deep = extractDeepDiscovery(html) || {};
-        const links = normalizeLinks(linksResponse.result);
 
         const pageData = extractPageData({
             html,
@@ -740,10 +748,20 @@ export async function onRequestPost(context) {
             truncated: html.length >= MAX_RESPONSE_BYTES,
         });
 
+        const links = normalizeLinks([
+            ...(deep.urls || []),
+            ...(pageData.links || []),
+        ]);
+
         const warnings = [
-            linksResponse.warning,
-            scrapeResponse?.warning,
-        ].filter(Boolean);
+            "Free-tier-safe mode uses one Cloudflare Browser Run snapshot Quick Action per rendered page. Links and resources are extracted from the returned DOM instead of issuing simultaneous /links and /scrape requests.",
+        ];
+
+        if (selectors.length) {
+            warnings.push(
+                "CSS selector Quick Action requests were skipped to avoid consuming additional Browser Run rate-limit slots. The complete rendered HTML is still returned for local selector processing."
+            );
+        }
 
         warnings.push(
             "Cloudflare REST Quick Actions render JavaScript and CSS, but do not expose complete request/response interception or persistent browser sessions. Use Browser Run sessions, CDP, Playwright, or Puppeteer when those capabilities are required."
@@ -786,18 +804,15 @@ export async function onRequestPost(context) {
                 challengeDetected: Boolean(
                     deep.challengeDetected
                 ),
-                selectorResults:
-                    scrapeResponse?.result || [],
+                selectorResults: [],
                 apiProbes: [],
                 source: "cloudflare-browser-run-rest",
             },
             usage: {
                 snapshotBrowserMs:
                     snapshotResponse.browserMsUsed || "",
-                linksBrowserMs:
-                    linksResponse.browserMsUsed || "",
-                scrapeBrowserMs:
-                    scrapeResponse?.browserMsUsed || "",
+                quickActionCount: 1,
+                rateLimitMode: "workers-free-compatible",
             },
             warnings,
             elapsedMs: Date.now() - startedAt,
